@@ -26,7 +26,21 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 from .config import AuditConfig
+from .contracts import read_json_object
+from .db_constants import (
+    RUN_CANCELLED,
+    RUN_DONE,
+    RUN_FAILED,
+    RUN_IMPORTED,
+    RUN_KIND_AUDIT,
+    RUN_KIND_MAINTENANCE,
+    RUN_KINDS,
+    RUN_RUNNING,
+    RUN_STATUSES,
+    RUN_SUPERSEDED,
+)
 from .disclosures import build_dedupe_key, extract_email_subject
+from .layout import stage_dir
 from .logger import get_logger
 from .poc_artifacts import (
     ASAN_REPORT_FILENAME,
@@ -56,25 +70,6 @@ from .utils import (
 
 DEFAULT_DB_PATH = os.path.join("~", ".code_auditor", "audits.db")
 
-RUN_RUNNING = "running"
-RUN_DONE = "done"
-RUN_FAILED = "failed"
-RUN_CANCELLED = "cancelled"
-RUN_IMPORTED = "imported"
-RUN_SUPERSEDED = "superseded"
-RUN_KIND_AUDIT = "audit"
-RUN_KIND_MAINTENANCE = "maintenance"
-RUN_KINDS = frozenset({RUN_KIND_AUDIT, RUN_KIND_MAINTENANCE})
-RUN_STATUSES = frozenset(
-    {
-        RUN_RUNNING,
-        RUN_DONE,
-        RUN_FAILED,
-        RUN_CANCELLED,
-        RUN_IMPORTED,
-        RUN_SUPERSEDED,
-    }
-)
 _POC_BACKFILL_OUTPUT_SUFFIX = "-poc-backfill"
 _POC_BACKFILL_OUTPUT_LIKE = f"%{_POC_BACKFILL_OUTPUT_SUFFIX}"
 _VULN_ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
@@ -101,6 +96,7 @@ CREATE TABLE IF NOT EXISTS runs (
     model TEXT,
     max_parallel INTEGER,
     target_au_count INTEGER,
+    full_analysis INTEGER NOT NULL DEFAULT 0,
     log_level TEXT,
     status TEXT NOT NULL,
     run_kind TEXT NOT NULL DEFAULT 'audit',
@@ -236,48 +232,6 @@ CREATE INDEX IF NOT EXISTS idx_reproduction_disclosure
     ON reproduction_runs(project, dedupe_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reproduction_state
     ON reproduction_runs(state, started_at DESC);
-CREATE TABLE IF NOT EXISTS bench_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    benchmark TEXT NOT NULL,
-    adapter TEXT NOT NULL,
-    repo_dir TEXT NOT NULL DEFAULT '',
-    output_dir TEXT NOT NULL,
-    backend TEXT,
-    model TEXT,
-    status TEXT NOT NULL,
-    error TEXT NOT NULL DEFAULT '',
-    started_at REAL,
-    ended_at REAL,
-    duration_seconds REAL NOT NULL DEFAULT 0,
-    total_instances INTEGER NOT NULL DEFAULT 0,
-    succeeded INTEGER NOT NULL DEFAULT 0,
-    failed INTEGER NOT NULL DEFAULT 0,
-    errors INTEGER NOT NULL DEFAULT 0,
-    score REAL NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_bench_runs_started
-    ON bench_runs(started_at DESC, id DESC);
-CREATE TABLE IF NOT EXISTS bench_results (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES bench_runs(id) ON DELETE CASCADE,
-    instance_id TEXT NOT NULL,
-    benchmark TEXT NOT NULL,
-    status TEXT NOT NULL,
-    success INTEGER,
-    score REAL NOT NULL DEFAULT 0,
-    extracted INTEGER NOT NULL DEFAULT 0,
-    submitted_length INTEGER NOT NULL DEFAULT 0,
-    detail TEXT NOT NULL DEFAULT '{}',
-    error TEXT NOT NULL DEFAULT '',
-    cleanup_error TEXT NOT NULL DEFAULT '',
-    agent_log TEXT NOT NULL DEFAULT '',
-    duration_seconds REAL NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL,
-    UNIQUE(run_id, instance_id)
-);
-CREATE INDEX IF NOT EXISTS idx_bench_results_run
-    ON bench_results(run_id, id);
 CREATE TABLE IF NOT EXISTS cves (
     cve_id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -309,26 +263,6 @@ CREATE TABLE IF NOT EXISTS analysis_units (
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_units_run ON analysis_units(run_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_units_target_key ON analysis_units(target_key);
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user')),
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL,
-    last_login_at REAL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_digest TEXT NOT NULL UNIQUE,
-    created_at REAL NOT NULL,
-    expires_at REAL NOT NULL,
-    last_seen_at REAL NOT NULL,
-    revoked_at REAL
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_digest);
-CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS provider_settings (
     backend TEXT PRIMARY KEY CHECK(backend IN ('claude', 'codex')),
     mode TEXT NOT NULL DEFAULT 'local' CHECK(mode IN ('local', 'custom')),
@@ -402,6 +336,7 @@ _RUN_EXTRA_COLUMNS = {
     "active_started_at": '"active_started_at" REAL',
     "duration_known": '"duration_known" INTEGER NOT NULL DEFAULT 1',
     "run_kind": "\"run_kind\" TEXT NOT NULL DEFAULT 'audit'",
+    "full_analysis": '"full_analysis" INTEGER NOT NULL DEFAULT 0',
     # A terminal maintenance run may carry a non-fatal cleanup note. Keep it
     # separate from ``error`` so the History badge does not report a completed
     # batch as ``done ⚠`` while retaining the diagnostic for the detail view.
@@ -629,12 +564,10 @@ def _retained_stage6_evidence(
     return trigger_graph_path, asan_report_path
 
 
-def _parse_finding(path: Path, output_dir: Path) -> dict[str, Any] | None:
+def _parse_finding(path: Path) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
+        data = read_json_object(path)
+    except ValueError:
         return None
     finding_key = path.stem
     au_id = finding_key.split("-F-")[0] if "-F-" in finding_key else ""
@@ -650,14 +583,10 @@ def _parse_finding(path: Path, output_dir: Path) -> dict[str, Any] | None:
     }
 
 
-def _parse_vuln(
-    path: Path, output_dir: Path, repo_url: str = ""
-) -> dict[str, Any] | None:
+def _parse_vuln(path: Path, repo_url: str = "") -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
+        data = read_json_object(path)
+    except ValueError:
         return None
     trace = data.get("data_flow_trace")
     trace = trace if isinstance(trace, dict) else {}
@@ -711,15 +640,12 @@ def scan_output_dir(
     if not base.is_dir():
         return result
 
-    aus_dir = base / "stage2-analysis-units"
+    aus_dir = Path(stage_dir(str(base), 2))
     if aus_dir.is_dir():
         for path in sorted(aus_dir.glob("AU-*.json")):
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                result["unreadable_keys"]["analysis_units"].append(path.stem)
-                continue
-            if not isinstance(data, dict):
+                data = read_json_object(path)
+            except ValueError:
                 result["unreadable_keys"]["analysis_units"].append(path.stem)
                 continue
             result["analysis_units"].append(
@@ -732,27 +658,26 @@ def scan_output_dir(
                 }
             )
 
-    for path in (
-        sorted((base / "stage3-findings").glob("*.json"))
-        if (base / "stage3-findings").is_dir()
-        else []
-    ):
-        finding = _parse_finding(path, base)
+    findings_dir = Path(stage_dir(str(base), 3))
+    for path in sorted(findings_dir.glob("*.json")) if findings_dir.is_dir() else []:
+        finding = _parse_finding(path)
         if finding:
             result["findings"].append(finding)
         else:
             result["unreadable_keys"]["findings"].append(path.stem)
 
-    vuln_dir = base / "stage4-vulnerabilities"
+    vuln_dir = Path(stage_dir(str(base), 4))
     if vuln_dir.is_dir():
         for path in sorted(vuln_dir.glob("*.json")):
-            vuln = _parse_vuln(path, base, repo_url)
+            if path.name == "semantic-dedupe.json" or path.parent.name == "_pending":
+                continue
+            vuln = _parse_vuln(path, repo_url)
             if vuln:
                 result["vulnerabilities"].append(vuln)
             else:
                 result["unreadable_keys"]["vulnerabilities"].append(path.stem)
 
-    pocs_dir = base / "stage5-pocs"
+    pocs_dir = Path(stage_dir(str(base), 5))
     if pocs_dir.is_dir():
         scanned_vuln_ids: set[str] = set()
         for report in sorted(pocs_dir.glob("*/report.md")):
@@ -780,7 +705,7 @@ def scan_output_dir(
                         "; ".join(graph_errors),
                     )
                 else:
-                    trigger_graph_path = str(trigger_graph.relative_to(base))
+                    trigger_graph_path = trigger_graph.relative_to(base).as_posix()
             asan_report = report.parent / ASAN_REPORT_FILENAME
             asan_report_path = ""
             if asan_report.is_file():
@@ -792,12 +717,12 @@ def scan_output_dir(
                         "; ".join(asan_errors),
                     )
                 else:
-                    asan_report_path = str(asan_report.relative_to(base))
+                    asan_report_path = asan_report.relative_to(base).as_posix()
             result["pocs"].append(
                 {
                     "vuln_id": vuln_id,
                     "status": status,
-                    "report_path": str(report.relative_to(base)),
+                    "report_path": report.relative_to(base).as_posix(),
                     "trigger_graph_path": trigger_graph_path,
                     "asan_report_path": asan_report_path,
                 }
@@ -826,7 +751,7 @@ def scan_output_dir(
                 }
             )
 
-    disclosures_dir = base / "stage6-disclosures"
+    disclosures_dir = Path(stage_dir(str(base), 6))
     if disclosures_dir.is_dir():
         for entry in sorted(disclosures_dir.iterdir()):
             disclosure = entry / "disclosure"
@@ -835,14 +760,14 @@ def scan_output_dir(
 
             def _rel(name: str) -> str:
                 p = disclosure / name
-                return str(p.relative_to(base)) if p.is_file() else ""
+                return p.relative_to(base).as_posix() if p.is_file() else ""
 
             trigger_graph_path, asan_report_path = _retained_stage6_evidence(
                 disclosure, entry.name
             )
 
             def _evidence_rel(path: str) -> str:
-                return str(Path(path).relative_to(base)) if path else ""
+                return Path(path).relative_to(base).as_posix() if path else ""
 
             result["disclosures"].append(
                 {
@@ -1011,94 +936,6 @@ class AuditStore:
         finally:
             conn.close()
 
-    # ── Web authentication ────────────────────────────────────────────────
-
-    def auth_user_count(self) -> int:
-        """Return the number of accounts, used to gate first-run setup."""
-        with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
-        return int(row["count"] if row else 0)
-
-    @staticmethod
-    def _public_user(row: sqlite3.Row | dict) -> dict[str, object]:
-        return {
-            "id": int(row["id"]),
-            "username": str(row["username"]),
-            "role": str(row["role"]),
-            "is_active": bool(row["is_active"]),
-            "created_at": float(row["created_at"]),
-            "last_login_at": (
-                float(row["last_login_at"])
-                if row["last_login_at"] is not None
-                else None
-            ),
-        }
-
-    def create_auth_user(
-        self, username: str, password_hash: str, *, role: str = "user"
-    ) -> dict[str, object]:
-        now = time.time()
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO users(username, password_hash, role, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (username, password_hash, role, now),
-            )
-            row = conn.execute(
-                "SELECT id, username, role, is_active, created_at, last_login_at "
-                "FROM users WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-        if row is None:  # pragma: no cover - SQLite guarantees the row exists
-            raise RuntimeError("created user could not be loaded")
-        return self._public_user(row)
-
-    def create_initial_auth_admin(
-        self, username: str, password_hash: str
-    ) -> dict[str, object]:
-        """Atomically create the one allowed first-run administrator."""
-        now = time.time()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
-                raise ValueError("administrator setup has already been completed")
-            cursor = conn.execute(
-                """
-                INSERT INTO users(username, password_hash, role, created_at)
-                VALUES (?, ?, 'admin', ?)
-                """,
-                (username, password_hash, now),
-            )
-            row = conn.execute(
-                "SELECT id, username, role, is_active, created_at, last_login_at "
-                "FROM users WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-        if row is None:  # pragma: no cover - SQLite guarantees the row exists
-            raise RuntimeError("created administrator could not be loaded")
-        return self._public_user(row)
-
-    def get_auth_user_by_username(self, username: str) -> dict[str, object] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, username, password_hash, role, is_active,
-                       created_at, last_login_at
-                FROM users WHERE username = ? COLLATE NOCASE
-                """,
-                (username,),
-            ).fetchone()
-        return dict(row) if row is not None else None
-
-    def mark_auth_login(self, user_id: int, now: float | None = None) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE users SET last_login_at = ? WHERE id = ?",
-                (time.time() if now is None else now, user_id),
-            )
-
     # ── Agent provider settings ───────────────────────────────────────────
 
     def get_provider_settings(self) -> dict[str, dict[str, str]]:
@@ -1211,70 +1048,18 @@ class AuditStore:
         """Record that the operator stored the key file; False when not managed."""
         return self._secret_cipher.acknowledge_backup()
 
-    def create_auth_session(
-        self,
-        user_id: int,
-        token_digest: str,
-        *,
-        created_at: float,
-        expires_at: float,
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sessions(
-                    user_id, token_digest, created_at, expires_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (user_id, token_digest, created_at, expires_at, created_at),
-            )
-
-    def get_auth_user_by_session(
-        self, token_digest: str, *, now: float | None = None
-    ) -> dict[str, object] | None:
-        current = time.time() if now is None else now
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT u.id, u.username, u.role, u.is_active,
-                       u.created_at, u.last_login_at
-                FROM sessions s
-                JOIN users u ON u.id = s.user_id
-                WHERE s.token_digest = ?
-                  AND s.revoked_at IS NULL
-                  AND s.expires_at > ?
-                  AND u.is_active = 1
-                """,
-                (token_digest, current),
-            ).fetchone()
-            if row is not None:
-                conn.execute(
-                    "UPDATE sessions SET last_seen_at = ? WHERE token_digest = ?",
-                    (current, token_digest),
-                )
-        return self._public_user(row) if row is not None else None
-
-    def revoke_auth_session(
-        self, token_digest: str, *, now: float | None = None
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET revoked_at = ? "
-                "WHERE token_digest = ? AND revoked_at IS NULL",
-                (time.time() if now is None else now, token_digest),
-            )
-
-    def purge_expired_auth_sessions(self, *, now: float | None = None) -> int:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL",
-                (time.time() if now is None else now,),
-            )
-        return int(cursor.rowcount)
-
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Authentication is intentionally not part of CodeAuditor. Drop
+            # credentials and bearer sessions left by older releases so the
+            # account/password system cannot remain usable after an upgrade.
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS sessions;
+                DROP TABLE IF EXISTS users;
+                """
+            )
             existing = {
                 row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()
             }
@@ -1953,7 +1738,11 @@ class AuditStore:
                 graph_path, asan_path = evidence_for(disclosure_dir)
 
                 def stored_path(path: str) -> str:
-                    return os.path.relpath(path, output_dir) if path else ""
+                    return (
+                        Path(os.path.relpath(path, output_dir)).as_posix()
+                        if path
+                        else ""
+                    )
 
                 cursor = conn.execute(
                     """
@@ -2099,10 +1888,10 @@ class AuditStore:
                 """
                 INSERT INTO runs (
                     target, output_dir, wiki_path,
-                    backend, model, max_parallel, target_au_count, log_level,
-                    status, run_kind, started_at, active_started_at,
+                    backend, model, max_parallel, target_au_count, full_analysis,
+                    log_level, status, run_kind, started_at, active_started_at,
                     duration_known, created_at, backends_used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     config.target,
@@ -2112,6 +1901,7 @@ class AuditStore:
                     config.model,
                     config.max_parallel,
                     config.target_au_count,
+                    int(config.full_analysis),
                     config.log_level,
                     status,
                     run_kind,
@@ -2123,6 +1913,23 @@ class AuditStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def update_running_run_usage(
+        self,
+        run_id: int,
+        usage_stats: Mapping[str, float],
+    ) -> bool:
+        """Persist partial token/cost accounting while a run is still active."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET usage_stats = ? WHERE id = ? AND status = ?",
+                (
+                    json.dumps(dict(usage_stats), ensure_ascii=False),
+                    run_id,
+                    RUN_RUNNING,
+                ),
+            )
+        return bool(cursor.rowcount)
 
     def finish_run(
         self,
@@ -2873,12 +2680,23 @@ class AuditStore:
                     (run_id, *sorted(REPRODUCED_STATUSES)),
                 ).fetchone()["count"]
             )
-            disclosures_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS count FROM disclosures "
-                    "WHERE run_id = ? AND report_path != ''",
-                    (run_id,),
-                ).fetchone()["count"]
+            disclosure_rows = conn.execute(
+                "SELECT vuln_id FROM disclosures "
+                "WHERE run_id = ? AND report_path != ''",
+                (run_id,),
+            ).fetchall()
+            # Stage 6 checkpoints are written only after static validation.
+            # Prefer them when present so failed drafts in directories do not
+            # inflate disclosures_count while historical output trees without
+            # markers retain the previous filesystem-derived behavior.
+            stage6_markers = {
+                path.name.removeprefix("stage6--")
+                for path in (Path(output_dir) / ".markers").glob("stage6--*")
+            }
+            disclosures_count = (
+                sum(1 for row in disclosure_rows if row["vuln_id"] in stage6_markers)
+                if stage6_markers
+                else len(disclosure_rows)
             )
             conn.execute(
                 """
@@ -3188,270 +3006,6 @@ class AuditStore:
             )
 
     # ── Reads ────────────────────────────────────────────────────────────
-
-    # ── Benchmark runs ────────────────────────────────────────────────────
-
-    def create_bench_run(
-        self,
-        *,
-        benchmark: str,
-        adapter: str,
-        output_dir: str,
-        repo_dir: str = "",
-        backend: str | None = None,
-        model: str | None = None,
-        started_at: float | None = None,
-        status: str = RUN_RUNNING,
-    ) -> int:
-        """Create a benchmark run row; results are appended per instance."""
-        if not benchmark.strip() or not adapter.strip():
-            raise ValueError("benchmark and adapter are required")
-        if not output_dir:
-            raise ValueError("output_dir is required")
-        if status not in RUN_STATUSES:
-            raise ValueError(f"Unsupported bench status: {status}")
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO bench_runs (
-                    benchmark, adapter, repo_dir, output_dir, backend, model,
-                    status, started_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    benchmark.strip(),
-                    adapter.strip(),
-                    repo_dir,
-                    output_dir,
-                    backend,
-                    model,
-                    status,
-                    time.time() if started_at is None else float(started_at),
-                    time.time(),
-                ),
-            )
-            return int(cursor.lastrowid)
-
-    def record_bench_result(self, run_id: int, result: Mapping[str, Any]) -> None:
-        """Insert or replace one instance result (idempotent per instance)."""
-        instance_id = str(result.get("instance_id") or "").strip()
-        status = str(result.get("status") or "").strip()
-        if not instance_id or not status:
-            raise ValueError("instance_id and status are required")
-        detail = result.get("detail") or {}
-        if not isinstance(detail, Mapping):
-            detail = {}
-        success = result.get("success")
-        success_value = None if success is None else int(bool(success))
-        with self._connect() as conn:
-            run = conn.execute(
-                "SELECT benchmark FROM bench_runs WHERE id = ?", (run_id,)
-            ).fetchone()
-            if run is None:
-                raise KeyError(f"Unknown benchmark run: {run_id}")
-            benchmark = str(result.get("benchmark") or run["benchmark"])
-            conn.execute(
-                """
-                INSERT INTO bench_results (
-                    run_id, instance_id, benchmark, status, success, score,
-                    extracted, submitted_length, detail, error, cleanup_error,
-                    agent_log, duration_seconds, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id, instance_id) DO UPDATE SET
-                    benchmark = excluded.benchmark,
-                    status = excluded.status,
-                    success = excluded.success,
-                    score = excluded.score,
-                    extracted = excluded.extracted,
-                    submitted_length = excluded.submitted_length,
-                    detail = excluded.detail,
-                    error = excluded.error,
-                    cleanup_error = excluded.cleanup_error,
-                    agent_log = excluded.agent_log,
-                    duration_seconds = excluded.duration_seconds
-                """,
-                (
-                    run_id,
-                    instance_id,
-                    benchmark,
-                    status,
-                    success_value,
-                    float(result.get("score") or 0.0),
-                    int(bool(result.get("extracted", False))),
-                    int(result.get("submitted_length") or 0),
-                    json.dumps(dict(detail), ensure_ascii=False),
-                    str(result.get("error") or "")[:4096],
-                    str(result.get("cleanup_error") or "")[:4096],
-                    str(result.get("agent_log") or "")[:4096],
-                    float(result.get("duration_seconds") or 0.0),
-                    time.time(),
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE bench_runs SET
-                    total_instances = (SELECT COUNT(*) FROM bench_results WHERE run_id = ?),
-                    succeeded = (SELECT COUNT(*) FROM bench_results WHERE run_id = ? AND status = 'succeeded'),
-                    failed = (SELECT COUNT(*) FROM bench_results WHERE run_id = ? AND status = 'failed'),
-                    errors = (SELECT COUNT(*) FROM bench_results WHERE run_id = ? AND status NOT IN ('succeeded', 'failed')),
-                    score = (SELECT COALESCE(SUM(score), 0) FROM bench_results WHERE run_id = ?)
-                WHERE id = ?
-                """,
-                (run_id, run_id, run_id, run_id, run_id, run_id),
-            )
-
-    def finish_bench_run(
-        self,
-        run_id: int,
-        *,
-        status: str,
-        error: str = "",
-        ended_at: float | None = None,
-        summary: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Finalize a benchmark run and persist aggregate counts."""
-        if status not in RUN_STATUSES:
-            raise ValueError(f"Unsupported bench status: {status}")
-        finished_at = time.time() if ended_at is None else float(ended_at)
-        with self._connect() as conn:
-            run = conn.execute(
-                "SELECT started_at FROM bench_runs WHERE id = ?", (run_id,)
-            ).fetchone()
-            if run is None:
-                raise KeyError(f"Unknown benchmark run: {run_id}")
-            if summary is None:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS total,
-                           COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded,
-                           COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
-                           COALESCE(SUM(CASE WHEN status NOT IN ('succeeded', 'failed') THEN 1 ELSE 0 END), 0) AS errors,
-                           COALESCE(SUM(score), 0) AS score
-                    FROM bench_results WHERE run_id = ?
-                    """,
-                    (run_id,),
-                ).fetchone()
-                counts = {
-                    "total": int(row["total"]),
-                    "succeeded": int(row["succeeded"]),
-                    "failed": int(row["failed"]),
-                    "errors": int(row["errors"]),
-                    "score": float(row["score"]),
-                }
-            else:
-                counts = {
-                    "total": int(summary.get("total") or 0),
-                    "succeeded": int(summary.get("succeeded") or 0),
-                    "failed": int(summary.get("failed") or 0),
-                    "errors": int(summary.get("errors") or 0),
-                    "score": float(summary.get("score") or 0.0),
-                }
-            duration = max(
-                0.0,
-                finished_at - float(run["started_at"] or finished_at),
-            )
-            conn.execute(
-                """
-                UPDATE bench_runs
-                SET status = ?, error = ?, ended_at = ?, duration_seconds = ?,
-                    total_instances = ?, succeeded = ?, failed = ?,
-                    errors = ?, score = ?
-                WHERE id = ?
-                """,
-                (
-                    status,
-                    str(error or "")[:4096],
-                    finished_at,
-                    duration,
-                    counts["total"],
-                    counts["succeeded"],
-                    counts["failed"],
-                    counts["errors"],
-                    counts["score"],
-                    run_id,
-                ),
-            )
-
-    def list_bench_runs(
-        self,
-        limit: int = 50,
-        offset: int = 0,
-        *,
-        benchmark: str | None = None,
-        status: str | None = None,
-        query: str | None = None,
-    ) -> tuple[list[dict], int]:
-        clauses: list[str] = []
-        args: list[Any] = []
-        if benchmark:
-            clauses.append("benchmark = ?")
-            args.append(benchmark)
-        if status:
-            if status not in RUN_STATUSES:
-                raise ValueError(f"Unsupported bench status: {status}")
-            clauses.append("status = ?")
-            args.append(status)
-        if query and (needle := query.strip().lower()):
-            fields = ("CAST(id AS TEXT)", "benchmark", "adapter", "repo_dir", "output_dir", "model")
-            clauses.append(
-                "(" + " OR ".join(f"instr(lower(COALESCE({field}, '')), ?) > 0" for field in fields) + ")"
-            )
-            args.extend([needle] * len(fields))
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit = max(1, min(int(limit), 500))
-        offset = max(0, int(offset))
-        with self._connect() as conn:
-            total = int(
-                conn.execute(f"SELECT COUNT(*) FROM bench_runs {where}", args).fetchone()[0]
-            )
-            rows = conn.execute(
-                f"""
-                SELECT * FROM bench_runs {where}
-                ORDER BY COALESCE(started_at, created_at) DESC, id DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*args, limit, offset),
-            ).fetchall()
-        return [self._public_bench_run(dict(row)) for row in rows], total
-
-    def get_bench_run(self, run_id: int) -> dict | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM bench_runs WHERE id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                return None
-            run = self._public_bench_run(dict(row))
-            results = conn.execute(
-                "SELECT * FROM bench_results WHERE run_id = ? ORDER BY id", (run_id,)
-            ).fetchall()
-        normalized = []
-        for item in results:
-            result = dict(item)
-            result["success"] = (
-                None if result.get("success") is None else bool(result["success"])
-            )
-            result["extracted"] = bool(result.get("extracted"))
-            try:
-                result["detail"] = json.loads(result.get("detail") or "{}")
-            except (TypeError, ValueError):
-                result["detail"] = {}
-            normalized.append(result)
-        run["results"] = normalized
-        return run
-
-    @staticmethod
-    def _public_bench_run(run: dict[str, Any]) -> dict[str, Any]:
-        for key in ("total_instances", "succeeded", "failed", "errors"):
-            run[key] = int(run.get(key) or 0)
-        run["score"] = float(run.get("score") or 0.0)
-        run["duration_seconds"] = float(run.get("duration_seconds") or 0.0)
-        run["success_rate"] = (
-            round(run["succeeded"] / run["total_instances"], 4)
-            if run["total_instances"]
-            else 0.0
-        )
-        return run
 
     def list_runs(
         self,
@@ -4853,8 +4407,8 @@ class AuditStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT dedupe_key, title, location, cwe,
-                       vulnerability_class, trigger, summary
+                SELECT project, dedupe_key, title, location, cwe,
+                       vulnerability_class, trigger, summary, artifact_links
                 FROM disclosed_bugs
                 WHERE deleted_at IS NULL
                 ORDER BY project, id

@@ -65,7 +65,7 @@ run 级轨迹通过 `observation.results[].subagent_trajectory_ref[].trajectory_
 
 一次调用里记录：
 
-1. **user** 步：实际发给 agent 的 prompt（`prompts/stageN.md` 渲染后的全文，含注入的 directive/wiki 上下文）。
+1. **user** 步：实际发给 agent 的 prompt（`code_auditor/prompts/stageN.md` 渲染后的全文，含注入的 directive/wiki 上下文）。
 2. **system** 步：SDK 的系统事件（`SystemMessage` 子类型）；遇到 compact 类子类型会带
    `step.extra.context_management.boundary = "replace"`。
 3. **agent** 步：一轮助手输出 —— 文本进 `message`，思考块进 `reasoning_content`，
@@ -160,7 +160,9 @@ Web API：
   `blobs[]` 扫描整棵树的 `*/blobs/*`，路径相对 `trajectories/`）
 - `GET /api/history/{run_id}/file?path=trajectories/...` → 完整子文档原文
 - `GET /api/history/{run_id}/results` 的 `trajectories` 字段列出所有轨迹文件
-- Web run 详情页的 Results 面板有 **Trajectories** 分组，可直接点开全文
+- Web run 详情页的 Results 面板保留 **Trajectories** 文件列表；下方的 Trajectory
+  可视化窗口提供 run/child 文档切换、时间概览、Step ledger、工具调用/结果检查器、
+  搜索以及实际时间/等宽模式
 
 ## 已知边界
 
@@ -173,9 +175,9 @@ Web API：
   （没有可靠的结果可记）。
 - **未做**：历史 run 的回填（`agent.log` 里没有工具参数，回填只能得到残缺轨迹）；
   把子轨迹内嵌进 run 级 `subagent_trajectories`（当前一律外链，避免单文件过大）。
-- **基准场景**尚未接入 orchestrator；`code_auditor/bench/` 已提供 TSECBench adapter 骨架
-  （见 `docs/tsecbench-integration.md`）。注意：基准 flag 会出现在工具输出里，接入时必须
-  先做精确擦除或关闭轨迹，`trajectory_redact` 的通用规则不认识任意 flag。
+- **独立 Reproduce/Backfill** 也使用运行级轨迹：Web latest-source Reproduce 和
+  PoC backfill 会在各自输出目录写入 `trajectories/trajectory.json`，并引用 Stage 5/6
+  与 Review Agent 的子轨迹。
 
 ## 代码位置
 
@@ -183,8 +185,7 @@ Web API：
 |---|---|
 | `code_auditor/trajectory.py` | recorder、路径布局、脱敏、blob、`validate_trajectory()`、usage→ATIF 映射 |
 | `code_auditor/agent.py` | `_open_trajectory` / `_flush_trajectory`，两个后端的消息 hook |
-| `code_auditor/orchestrator.py` | run 级轨迹的创建、阶段 system 步、收尾与 `final_metrics` |
+| `code_auditor/orchestrator.py` | audit、Reproduce、Backfill 共用的 run 级轨迹创建与收尾 |
 | `code_auditor/web/server.py` | `/api/history/{id}/trajectory`，results 列表的 `trajectories` |
 | `code_auditor/__main__.py` | `--validate-trajectory` |
 | `code_auditor/tests/test_trajectory.py` | 映射、约束、脱敏、续写、路径、resume、引用完整性 |
-| `code_auditor/bench/` | benchmark adapter 骨架（首个：TSECBench） |

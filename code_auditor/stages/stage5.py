@@ -8,6 +8,7 @@ import shutil
 from ..agent import run_agent
 from ..checkpoint import CheckpointManager
 from ..config import AuditConfig, select_poc_model
+from ..layout import checkpoint_key, stage5_paths
 from ..logger import get_logger
 from ..poc_artifacts import (
     ASAN_REPORT_FILENAME,
@@ -20,9 +21,11 @@ from ..reproduction_status import is_failed_status, read_reproduction_status
 from ..retention import (
     RetentionError,
     export_retained_artifacts,
+    load_retain_manifest,
     secure_generated_manifest_mode,
 )
 from ..sandbox import DockerScratch, docker_scratch
+from ..stage_runtime import finalize_checkpoint, repair_until_valid
 from ..utils import collect_parallel_results, format_validation_issues, run_parallel_limited
 from ..validation.stage5 import validate_stage5_trigger_graph
 from ..wiki import build_wiki_context
@@ -56,7 +59,7 @@ def _poc_agent_kwargs(
 
 
 def _task_key(vuln_id: str) -> str:
-    return f"stage5:{vuln_id}"
+    return checkpoint_key(5, vuln_id)
 
 
 def _is_fp_report(report_path: str | None) -> bool:
@@ -132,7 +135,9 @@ async def _run_reproduce(
         return None
 
     key = _task_key(vuln_id)
-    persistent_poc_dir = os.path.join(config.output_dir, "stage5-pocs", vuln_id)
+    persistent_poc_dir = os.path.join(
+        stage5_paths(config.output_dir)["directory"], vuln_id
+    )
 
     if checkpoint.is_complete(key):
         resolved = _resolve_reproduction_report(persistent_poc_dir)
@@ -199,7 +204,9 @@ async def _run_reproduce(
             )
 
         poc_target = work_config.poc_worktree or work_config.target
-        poc_dir = os.path.join(work_config.output_dir, "stage5-pocs", vuln_id)
+        poc_dir = os.path.join(
+            stage5_paths(work_config.output_dir)["directory"], vuln_id
+        )
         os.makedirs(poc_dir, exist_ok=True)
 
         prompt = load_prompt(
@@ -239,20 +246,25 @@ async def _run_reproduce(
                     vuln_id,
                     format_validation_issues(issues),
                 )
-                repair_prompt = (
-                    f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
-                    "Create or repair it using only the call path verified while running "
-                    "the PoC. Do not invent stack frames, parameter values, sanitizer "
-                    "output, or runtime evidence. Fix every issue below:\n\n"
-                    f"```\n{format_validation_issues(issues)}\n```"
+                issues = await repair_until_valid(
+                    validator=lambda: validate_stage5_trigger_graph(
+                        resolved_poc_dir, vuln_id
+                    ),
+                    repair=lambda current_prompt: run_agent(
+                        current_prompt,
+                        work_config,
+                        max_turns=15,
+                        **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
+                    ),
+                    repair_prompt=lambda current: (
+                        f"The Stage 5 trigger graph at `{graph_path}` is missing or invalid. "
+                        "Create or repair it using only the call path verified while running "
+                        "the PoC. Do not invent stack frames, parameter values, sanitizer "
+                        "output, or runtime evidence. Fix every issue below:\n\n"
+                        f"```\n{format_validation_issues(current)}\n```"
+                    ),
+                    max_attempts=2,
                 )
-                await run_agent(
-                    repair_prompt,
-                    work_config,
-                    max_turns=15,
-                    **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
-                )
-                issues = validate_stage5_trigger_graph(resolved_poc_dir, vuln_id)
                 if issues:
                     logger.warning(
                         "Stage 5: Trigger graph remains unavailable for %s\n%s",
@@ -317,6 +329,44 @@ async def _run_reproduce(
             )
             resolved_report = os.path.join(persistent_destination, "report.md")
 
+        if sandbox is None and reproduced and resolved_report is not None:
+            retained_source = os.path.dirname(resolved_report)
+            secure_generated_manifest_mode(retained_source)
+            try:
+                load_retain_manifest(
+                    retained_source,
+                    required_paths=("report.md", "reproduce.sh"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
+            except RetentionError as exc:
+                logger.warning(
+                    "Stage 5: Local retained package for %s is invalid: %s. "
+                    "Requesting one bounded repair.",
+                    vuln_id,
+                    exc,
+                )
+                repair_prompt = (
+                    f"The local Stage 5 retained package at `{retained_source}` is invalid: "
+                    f"{exc}. Repair `retain-manifest.json` and the minimal retained files it "
+                    "lists. Keep `report.md` and `reproduce.sh`; make the reproducer portable "
+                    "by removing references to CodeAuditor scratch/worktree/toolchain/home "
+                    "state. Do not rerun the PoC or change the observed reproduction result."
+                )
+                await run_agent(
+                    repair_prompt,
+                    work_config,
+                    max_turns=15,
+                    **_poc_agent_kwargs(config, poc_target, log_file, sandbox),
+                )
+                secure_generated_manifest_mode(retained_source)
+                load_retain_manifest(
+                    retained_source,
+                    required_paths=("report.md", "reproduce.sh"),
+                    max_file_bytes=config.retain_max_file_bytes,
+                    max_total_bytes=config.retain_max_total_bytes,
+                )
+
     if resolved_report is None:
         # No retained report means the task did not finish; leave the
         # checkpoint unset so a resume retries it instead of treating an
@@ -327,7 +377,7 @@ async def _run_reproduce(
         )
         return None
 
-    checkpoint.mark_complete(key)
+    finalize_checkpoint(checkpoint, key, valid=True)
     if _is_fp_report(resolved_report):
         logger.info("Stage 5: %s marked as false positive.", vuln_id)
         return None
@@ -358,6 +408,7 @@ async def run_stage5(
     vuln_files: list[str],
     config: AuditConfig,
     checkpoint: CheckpointManager,
+    progress: object | None = None,
 ) -> list[str]:
     """Run PoC reproduction for each verified vulnerability in parallel."""
     if not vuln_files:
@@ -366,10 +417,23 @@ async def run_stage5(
 
     logger.info("Stage 5: Reproducing %d verified vulnerabilities.", len(vuln_files))
 
+    completed = 0
+
+    def task_complete(index: int, vuln_file: str) -> None:
+        nonlocal completed
+        completed += 1
+        if progress is not None:
+            progress.update(
+                items_done=completed,
+                items_total=len(vuln_files),
+                detail=f"Reproduced {completed}/{len(vuln_files)} vulnerabilities",
+            )
+
     results = await run_parallel_limited(
         vuln_files,
         config.max_parallel,
         lambda vf, _: _run_reproduce(vf, config, checkpoint),
+        on_complete=task_complete,
     )
 
     reports = collect_parallel_results(

@@ -10,79 +10,7 @@
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css" />
 </head>
 <body>
-  <div id="auth-loading" role="status" aria-live="polite">Checking your session…</div>
-  <section id="auth-gate" aria-labelledby="auth-title" hidden>
-    <div class="auth-card">
-      <div class="auth-brand">
-        <img class="auth-logo" src="/static/icon.svg" alt="" aria-hidden="true" />
-        <span>CodeAuditor</span>
-      </div>
-      <h1 id="auth-title">Sign in to CodeAuditor</h1>
-      <p id="auth-intro" class="dim">Use your CodeAuditor account to access audit history and evidence.</p>
-
-      <section id="auth-setup-panel" class="auth-panel" hidden>
-        <h2>First-run setup</h2>
-        <p class="dim">Create the administrator account before using the Web UI.</p>
-        <form id="auth-setup-form" class="auth-form">
-          <label>Administrator username
-            <input id="auth-setup-username" name="username" type="text" minlength="3" maxlength="64"
-                   pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="username" required />
-          </label>
-          <label>Password
-            <input id="auth-setup-password" name="password" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <label>Confirm password
-            <input id="auth-setup-confirm" name="confirm" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <button type="submit" class="btn btn-start">Create administrator</button>
-        </form>
-      </section>
-
-      <section id="auth-login-panel" class="auth-panel" hidden>
-        <h2>Sign in</h2>
-        <form id="auth-login-form" class="auth-form">
-          <label>Username
-            <input id="auth-login-username" name="username" type="text" minlength="3" maxlength="64"
-                   autocomplete="username" required />
-          </label>
-          <label>Password
-            <input id="auth-login-password" name="password" type="password" maxlength="512"
-                   autocomplete="current-password" required />
-          </label>
-          <button type="submit" class="btn btn-start">Sign in</button>
-        </form>
-      </section>
-
-      <section id="auth-register-panel" class="auth-panel" hidden>
-        <h2>Create account</h2>
-        <form id="auth-register-form" class="auth-form">
-          <label>Username
-            <input id="auth-register-username" name="username" type="text" minlength="3" maxlength="64"
-                   pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" autocomplete="username" required />
-          </label>
-          <label>Password
-            <input id="auth-register-password" name="password" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <label>Confirm password
-            <input id="auth-register-confirm" name="confirm" type="password" minlength="12" maxlength="512"
-                   autocomplete="new-password" required />
-          </label>
-          <button type="submit" class="btn btn-start">Create account</button>
-        </form>
-      </section>
-
-      <p id="auth-error" class="error" role="alert"></p>
-      <p id="auth-switch" class="auth-switch" hidden>
-        <span id="auth-switch-copy">Need an account?</span>
-        <button type="button" id="auth-switch-button" class="link-button">Create account</button>
-      </p>
-    </div>
-  </section>
-
-  <div id="app-shell" class="layout" hidden>
+  <div id="app-shell" class="layout">
   <aside id="sidebar">
     <div class="sidebar-header">
       <img class="logo-mark" src="/static/icon.svg" alt="" aria-hidden="true" />
@@ -100,10 +28,6 @@
       <a href="#/history" class="tab" data-route="history" aria-label="History" title="History">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <span>History</span>
-      </a>
-      <a href="#/benchmarks" class="tab" data-route="benchmarks" aria-label="Benchmarks" title="Benchmarks">
-        <svg viewBox="0 0 24 24"><path d="M5 21V4"/><path d="M5 4h11l-2 4 2 4H5"/><path d="M9 21h4"/></svg>
-        <span>Benchmarks</span>
       </a>
       <a href="#/disclosures" class="tab" data-route="disclosures" aria-label="Disclosures" title="Disclosures">
         <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
@@ -132,10 +56,6 @@
   <div id="workspace">
   <header id="workspace-toolbar">
     <span id="agent-settings-summary" class="agent-settings-summary">Loading LLM backend…</span>
-    <div id="auth-user-menu" class="auth-user-menu" hidden>
-      <span id="auth-user-label" class="auth-user-label"></span>
-      <button type="button" id="btn-logout" class="btn">Sign out</button>
-    </div>
     <button type="button" id="btn-settings" class="btn workspace-settings-button"
             aria-haspopup="dialog" aria-controls="settings-dialog" title="Configure runtime settings">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
@@ -297,6 +217,13 @@
             Max parallel agents
             <input type="number" name="max_parallel" id="f-max-parallel"
                    min="1" max="16" value="1" />
+          </label>
+          <label class="settings-checkbox audit-full-analysis">
+            <input type="checkbox" id="f-full-analysis" />
+            <span>
+              <strong>Full analysis</strong>
+              <small>Reproduce every severity in Stage 5. Off by default: only Critical and High findings are reproduced.</small>
+            </span>
           </label>
           <label>
             Wiki knowledge base
@@ -517,6 +444,45 @@
         </div>
       </section>
 
+      <section class="panel" id="trajectory-visualizer-panel" hidden>
+        <header class="trajectory-header">
+          <div>
+            <h2>Trajectory</h2>
+            <p class="hint">ATIF event ledger and timing overview</p>
+          </div>
+          <div class="trajectory-stats" id="trajectory-stats"></div>
+        </header>
+        <div class="trajectory-toolbar">
+          <label class="trajectory-document-picker">
+            <span>Document</span>
+            <select id="trajectory-document-select"></select>
+          </label>
+          <label class="toolbar-search trajectory-search">
+            <span>Search</span>
+            <input id="trajectory-search" type="search" maxlength="256"
+                   autocomplete="off" placeholder="Search steps, tools, output…" />
+          </label>
+          <label class="trajectory-mode">
+            <input id="trajectory-actual-time" type="checkbox" checked />
+            Actual timing
+          </label>
+          <button type="button" id="btn-trajectory-refresh" class="btn btn-compact">Refresh</button>
+          <button type="button" id="btn-trajectory-expand" class="btn btn-compact">Expand all</button>
+        </div>
+        <div class="trajectory-overview" id="trajectory-overview">
+          <div class="trajectory-overview-title">Overview</div>
+          <div id="trajectory-timeline" class="trajectory-timeline" aria-label="Trajectory timing overview"></div>
+        </div>
+        <div class="trajectory-layout">
+          <div class="trajectory-ledger-shell">
+            <div id="trajectory-ledger" class="trajectory-ledger" role="list"></div>
+          </div>
+          <aside id="trajectory-inspector" class="trajectory-inspector">
+            <div class="trajectory-inspector-empty">Select a step to inspect its message, tool calls, results, and metrics.</div>
+          </aside>
+        </div>
+      </section>
+
       <section class="panel" id="viewer-panel" hidden>
         <h2 id="viewer-title">File</h2>
         <pre id="viewer-content"></pre>
@@ -656,109 +622,6 @@
         </div>
       </section>
     </div><!-- /view-reproduction -->
-
-    <div id="view-benchmarks" hidden>
-      <section class="panel">
-        <h2>Start Benchmark Run</h2>
-        <form id="benchmark-start-form" class="form-grid">
-          <label>
-            Benchmark
-            <select id="benchmark-start-adapter" required></select>
-          </label>
-          <label class="settings-wide-field">
-            Dataset directory
-            <input id="benchmark-start-repo" type="text" maxlength="4096"
-                   autocomplete="off" placeholder="/data/CTFTiny" />
-            <span class="hint">CTFTiny/CyBench need a checkout under state-dir <code>benchmarks/</code>, the managed repos directory, or <code>CODE_AUDITOR_BENCH_ROOTS</code>; TSECBench ignores this field.</span>
-          </label>
-          <label>
-            Max turns
-            <input id="benchmark-start-turns" type="number" min="1" max="500" value="100" required />
-          </label>
-          <label class="settings-checkbox">
-            <input id="benchmark-start-trajectory" type="checkbox" />
-            Capture ATIF trajectory
-          </label>
-          <div class="button-row">
-            <button type="submit" id="btn-benchmark-start" class="btn btn-start">Start run</button>
-            <span id="benchmark-start-message" class="dim" role="status"></span>
-          </div>
-        </form>
-        <p class="hint">
-          TSECBench reads <code>BENCHMARK_BASE_URL</code> / <code>BENCHMARK_TOKEN</code> from the
-          server environment and requires the VPN to be up.
-        </p>
-      </section>
-      <section class="panel">
-        <h2>Benchmark Runs</h2>
-        <p id="benchmarks-message" class="registry-message dim" role="status"></p>
-        <div class="registry-toolbar">
-          <label class="toolbar-search">
-            <span>Search</span>
-            <input id="benchmarks-search" type="search" maxlength="256"
-                   autocomplete="off" placeholder="Run, benchmark, adapter, path…">
-          </label>
-          <label class="toolbar-filter">
-            <span>Status</span>
-            <select id="benchmarks-status">
-              <option value="">All statuses</option>
-              <option value="running">Running</option>
-              <option value="done">Complete</option>
-              <option value="failed">Failed</option>
-              <option value="cancelled">Cancelled</option>
-            </select>
-          </label>
-          <button type="button" id="btn-benchmarks-refresh" class="btn">Refresh</button>
-          <span id="benchmarks-count" class="record-count" aria-live="polite"></span>
-        </div>
-        <div class="table-shell" tabindex="0" aria-label="Benchmark runs">
-          <table id="benchmarks-table">
-            <thead>
-              <tr>
-                <th>ID</th><th>Benchmark</th><th>Status</th><th>Instances</th>
-                <th>Succeeded</th><th>Failed</th><th>Errors</th><th>Score</th>
-                <th>Model</th><th>Started</th><th></th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-    </div><!-- /view-benchmarks -->
-
-    <div id="view-benchmark-detail" hidden>
-      <section class="panel">
-        <div class="history-run-header">
-          <div>
-            <a href="#/benchmarks" class="back-link">← Back to benchmarks</a>
-            <h2 id="benchmark-detail-title">Benchmark Run</h2>
-          </div>
-          <div class="history-run-actions">
-            <button type="button" id="btn-benchmark-stop" class="btn btn-stop" hidden>Stop</button>
-          </div>
-        </div>
-        <p id="benchmark-detail-message" class="registry-message dim" role="status"></p>
-        <div id="benchmark-detail-meta" class="meta-grid"></div>
-      </section>
-      <section class="panel">
-        <h2>Results</h2>
-        <div class="table-shell" tabindex="0" aria-label="Benchmark results">
-          <table id="benchmark-results-table">
-            <thead>
-              <tr>
-                <th>Instance</th><th>Status</th><th>Success</th><th>Score</th>
-                <th>Extracted</th><th>Duration</th><th>Error</th><th>Log</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-      <section class="panel" id="benchmark-log-panel" hidden>
-        <h2 id="benchmark-log-title">Agent log</h2>
-        <pre id="benchmark-log-content"></pre>
-      </section>
-    </div><!-- /view-benchmark-detail -->
 
     <div id="view-history" hidden>
       <section class="panel">

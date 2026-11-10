@@ -4,9 +4,11 @@ CodeAuditor 的 Stage 5/6 支持 Docker 沙箱，可以选择 `docker-default`�
 
 本教程针对 **CodeAuditor 与 Docker daemon 位于同一台 Linux 主机、使用系统级 Docker Engine** 的部署。Docker 安装脚本支持 Ubuntu 22.04、24.04、26.04 的 amd64/arm64；其他发行版按 [Docker 官方安装入口](https://docs.docker.com/engine/install/)操作。当前 gVisor 要求 Linux 5.6+，支持 x86_64 和 ARM64，参见[官方安装说明](https://gvisor.dev/docs/user_guide/install/)。Docker Desktop、远程 daemon 和 rootless 组合尚未经过本项目验证。
 
+原生 macOS 和原生 Windows 不支持 Docker Stage 5/6 路径：前者无法把宿主 Agent 二进制挂载到 Linux 容器中执行，后者还缺少 Linux UID/GID 与进程组语义。两者应选择 **Local worktree**；需要 Docker 隔离时请运行在 Linux VM、Linux 主机或 WSL2/Linux 中。
+
 ## 配套脚本
 
-以下命令都在仓库根目录运行。Python 脚本使用 **Python 3.12+**；`sandboxctl.py` 使用安装了 CodeAuditor 的 Python 环境。
+以下命令都在仓库根目录运行。Python 脚本使用 **Python 3.12+**；`sandboxctl.py` 使用 `uv sync` 创建的项目环境。
 
 | 脚本 | 用途 | 执行行为 |
 | --- | --- | --- |
@@ -53,13 +55,12 @@ sudo usermod -aG docker "$(id -un)"
 ### 构建镜像并验证 runc
 
 ```bash
-python --version  # 需要 3.12+
-python -m pip install -e '.[test]'
-python scripts/sandbox/sandboxctl.py build-image
+uv sync --locked
+uv run python scripts/sandbox/sandboxctl.py build-image
 
 # 以服务账号、相同 Python 环境和环境变量运行；按实际后端选择 claude 或 codex
-python scripts/sandbox/sandboxctl.py check --runtime runc --backend claude
-python scripts/sandbox/sandboxctl.py verify --runtime runc
+uv run python scripts/sandbox/sandboxctl.py check --runtime runc --backend claude
+uv run python scripts/sandbox/sandboxctl.py verify --runtime runc
 ```
 
 构建使用本仓库的 Dockerfile，默认镜像为 `code-auditor-sandbox:latest`；首次构建会下载 Ubuntu 基础镜像和编译工具，需要更新基础镜像时加 `--pull`。等价的构建命令是：
@@ -137,8 +138,8 @@ sudo "$(command -v python)" scripts/sandbox/configure-gvisor.py \
 ```bash
 sudo systemctl reload docker
 docker info --format 'default={{.DefaultRuntime}} runtimes={{range $name, $value := .Runtimes}}{{$name}} {{end}}'
-python scripts/sandbox/sandboxctl.py check --runtime runsc --backend claude
-python scripts/sandbox/sandboxctl.py verify --runtime runsc
+uv run python scripts/sandbox/sandboxctl.py check --runtime runsc --backend claude
+uv run python scripts/sandbox/sandboxctl.py verify --runtime runsc
 ```
 
 Docker 支持 reload 更新 `runtimes`，见 [daemon 配置重载说明](https://docs.docker.com/reference/cli/dockerd/#configuration-reload-behavior)。列表中应出现 `runsc`，默认 runtime 保持原值。若服务不支持 reload，或配置与启动参数冲突，先查看 `journalctl -u docker -n 100 --no-pager` 并核对服务配置；确实需要 restart 时，安排所有相关容器任务结束后再进行。
@@ -215,7 +216,7 @@ Directories have mode `0700`; newly created records and logs have mode `0600`. R
 
 Records include Run/job and invocation identities, source commit, requested and inspected runtime/image identity, available Docker/runtime/kernel versions, requested and inspected resource/network settings, selected security options, exit/OOM state, and cleanup result. Missing version information remains `null`; a local binary version is not assumed to represent the daemon's runtime. Records intentionally omit command arguments, environment variables, credentials, and complete Docker inspect output. Agent logs still contain Agent output and should be treated as sensitive.
 
-The Web UI does not display these records; they stay host-side logs and journal files. Full records are available through the authenticated API (100 launches per page by default):
+The Web UI does not display these records; they stay host-side logs and journal files. Full records are available through the API (100 launches per page by default):
 
 - `GET /api/history/{run_id}/sandbox-executions?limit=100&offset=0` (maximum page size 500), filtered by Run ID even when output directories are reused.
 - `GET /api/reproduction/{job_key}/sandbox-executions`, for a standalone reproduction job retained by the Web worker.
@@ -229,7 +230,7 @@ Use the setup steps above to install and register `runsc`. The application and t
 For deployment verification, prefer `sandboxctl.py verify --runtime runc` or `--runtime runsc`, which treats missing prerequisites and skipped tests as failures. Developers can also opt into the original benign checks, which allow explicit skips:
 
 ```bash
-CODE_AUDITOR_RUN_SANDBOX_TESTS=1 python -m pytest -q -rs \
+CODE_AUDITOR_RUN_SANDBOX_TESTS=1 uv run pytest -q -rs \
   code_auditor/tests/test_sandbox_integration.py
 ```
 

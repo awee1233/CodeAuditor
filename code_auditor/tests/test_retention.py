@@ -12,7 +12,14 @@ from code_auditor.retention import (
     export_retained_artifacts,
     load_retain_manifest,
     secure_generated_manifest_mode,
+    write_retain_manifest_v2,
 )
+from code_auditor.secure_fs import harden_private_file, private_file_is_secure
+
+
+def _harden_if_windows(path: Path) -> None:
+    if os.name == "nt":
+        harden_private_file(path)
 
 
 def _write_retained_tree(root: Path) -> None:
@@ -38,6 +45,7 @@ def _write_retained_tree(root: Path) -> None:
         encoding="utf-8",
     )
     manifest_path.chmod(0o600)
+    _harden_if_windows(manifest_path)
 
 
 def test_export_retained_artifacts_replaces_destination_with_manifest_only(
@@ -117,6 +125,9 @@ def test_manifest_rejects_hardlinked_files(tmp_path: Path) -> None:
         load_retain_manifest(source)
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows private-file enforcement uses DACLs"
+)
 def test_manifest_rejects_group_or_world_access(tmp_path: Path) -> None:
     source = tmp_path / "scratch"
     _write_retained_tree(source)
@@ -133,7 +144,10 @@ def test_secure_generated_manifest_mode_tightens_regular_file(tmp_path: Path) ->
     manifest_path.chmod(0o644)
 
     assert secure_generated_manifest_mode(source) is True
-    assert manifest_path.stat().st_mode & 0o777 == 0o600
+    if os.name == "nt":
+        assert private_file_is_secure(manifest_path)
+    else:
+        assert manifest_path.stat().st_mode & 0o777 == 0o600
     assert load_retain_manifest(source).entrypoint == "reproduce.sh"
 
 
@@ -155,9 +169,50 @@ def test_manifest_rejects_nonportable_support_file(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files"].append({"path": "config.json", "role": "support"})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _harden_if_windows(manifest_path)
 
     with pytest.raises(RetentionError, match="references disposable"):
         load_retain_manifest(source)
+
+
+def test_manifest_accepts_bash_entrypoint(tmp_path: Path) -> None:
+    source = tmp_path / "scratch"
+    _write_retained_tree(source)
+    manifest_path = source / RETAIN_MANIFEST_FILENAME
+    write_retain_manifest_v2(
+        source,
+        entrypoint="reproduce.sh",
+        platform="linux",
+        interpreter="bash",
+        argv=[],
+        files=[("reproduce.sh", "entrypoint"), ("report.md", "report")],
+    )
+
+    loaded = load_retain_manifest(source)
+
+    assert loaded.interpreter == "bash"
+
+
+def test_manifest_allows_bounded_binary_support_payload(tmp_path: Path) -> None:
+    source = tmp_path / "scratch"
+    _write_retained_tree(source)
+    (source / "trigger.avi").write_bytes(b"\x00RIFF\x00binary-video")
+    write_retain_manifest_v2(
+        source,
+        entrypoint="reproduce.sh",
+        platform="linux",
+        interpreter="sh",
+        argv=[],
+        files=[
+            ("reproduce.sh", "entrypoint"),
+            ("report.md", "report"),
+            ("trigger.avi", "support"),
+        ],
+    )
+
+    loaded = load_retain_manifest(source)
+
+    assert any(item.path == "trigger.avi" for item in loaded.files)
 
 
 def test_manifest_allows_bounded_binary_reproduction_input(tmp_path: Path) -> None:
@@ -168,6 +223,7 @@ def test_manifest_allows_bounded_binary_reproduction_input(tmp_path: Path) -> No
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files"].append({"path": "state.sav", "role": "input"})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _harden_if_windows(manifest_path)
 
     loaded = load_retain_manifest(source)
 

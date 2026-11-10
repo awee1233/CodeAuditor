@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
+from fastapi import FastAPI, Header, HTTPException, Query, Response, WebSocket
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -41,7 +41,6 @@ from ..db import (
     RUN_RUNNING,
     AuditStore,
 )
-from ..bench import BenchRunner, create as create_benchmark_adapter, registered as registered_benchmarks
 from ..logger import configure_logging, get_logger
 from ..repos import RepoError, list_cloned_repos, validate_remote_repo_url
 from ..retention import RetentionError, export_retained_artifacts
@@ -59,15 +58,6 @@ from .job import (
     JobValidationError,
     ReproductionStartParams,
 )
-from .auth import (
-    SESSION_COOKIE_NAME,
-    SESSION_TTL_SECONDS,
-    hash_password,
-    new_session_token,
-    normalize_username,
-    session_token_digest,
-    verify_password,
-)
 from .local_directories import (
     LocalDirectoryPickerError,
     LocalDirectoryPickerUnavailable,
@@ -75,6 +65,7 @@ from .local_directories import (
     validate_local_audit_target,
 )
 from .progress import install_web_log_handler
+from .history import _run_stage_summary
 from .settings import (
     DEFAULT_SETTINGS_PATH,
     ModelProviderSettings,
@@ -123,17 +114,6 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
-class AuthCredentialsRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    username: str = Field(
-        min_length=3,
-        max_length=64,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$",
-    )
-    password: str = Field(min_length=12, max_length=512)
-
-
 class AuditStartRequest(StrictRequest):
     repository: str | None = Field(
         default=None, min_length=1, max_length=512, pattern=_REPOSITORY_NAME_PATTERN
@@ -149,6 +129,7 @@ class AuditStartRequest(StrictRequest):
         default=None, min_length=1, max_length=512, pattern=_REPOSITORY_NAME_PATTERN
     )
     max_parallel: int = Field(default=1, ge=1, le=16)
+    full_analysis: bool = False
 
     @field_validator("repository", "wiki")
     @classmethod
@@ -272,7 +253,9 @@ def _scan_results(output_dir: str) -> dict:
         if not base.is_dir():
             return []
         return sorted(
-            str(p.relative_to(base)) for p in base.glob(pattern) if p.is_file()
+            p.relative_to(base).as_posix()
+            for p in base.glob(pattern)
+            if p.is_file()
         )
 
     return {
@@ -284,7 +267,8 @@ def _scan_results(output_dir: str) -> dict:
         "reproduction_result": rel("reproduction-result.json"),
         "trajectories": rel("trajectories/**/*.json"),
         "agent_logs": [
-            str(path.relative_to(base)) for path in _agent_log_paths(output_dir)
+            path.relative_to(base).as_posix()
+            for path in _agent_log_paths(output_dir)
         ],
     }
 
@@ -307,7 +291,7 @@ def _latest_agent_log(output_dir: str) -> tuple[Path, str] | None:
     if not paths:
         return None
     path = paths[-1]
-    return path, str(path.relative_to(Path(output_dir)))
+    return path, path.relative_to(Path(output_dir)).as_posix()
 
 
 def _agent_log_response(output_dir: str, download: bool):
@@ -346,88 +330,6 @@ def _output_file_response(output_dir: str, rel_path: str, download: bool):
     except OSError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return PlainTextResponse(content)
-
-
-def _count_json_files(base: Path, pattern: str) -> int:
-    directory = base / pattern.split("/")[0]
-    if not directory.is_dir():
-        return 0
-    return sum(1 for p in base.glob(pattern) if p.is_file())
-
-
-def _run_stage_summary(run: dict) -> list[dict]:
-    """Reconstruct per-stage status for a finished run from on-disk evidence.
-
-    Live runs get stage updates from the progress reporter instead; this
-    summary lets the History detail page show Stages for completed, failed,
-    cancelled, and imported runs. Completion is derived from checkpoint
-    markers (``.markers/``), falling back to artifact presence for runs that
-    predate marker-based tracking.
-    """
-    base = Path(run.get("output_dir") or "")
-    markers: set[str] = set()
-    markers_dir = base / ".markers"
-    if markers_dir.is_dir():
-        markers = {p.name for p in markers_dir.iterdir() if p.is_file()}
-
-    au_total = len(run.get("analysis_units") or [])
-    findings_total = _count_json_files(base, "stage3-findings/*.json")
-    vuln_total = len(run.get("vulnerabilities") or []) + len(
-        run.get("poc_issues") or []
-    )
-    disclosures_total = int(run.get("disclosures_count") or 0)
-    failed = run.get("status") == "failed"
-
-    def entry(
-        stage: int,
-        done: bool,
-        items_done: int = 0,
-        items_total: int = 0,
-        detail: str = "",
-    ) -> dict:
-        if done:
-            status = "done"
-        elif failed and items_done > 0:
-            status = "failed"
-        else:
-            status = "pending"
-        return {
-            "stage": stage,
-            "status": status,
-            "detail": detail,
-            "items_done": items_done,
-            "items_total": items_total,
-        }
-
-    def marked(prefix: str, total: int, artifacts_exist: bool) -> tuple[bool, int]:
-        done_count = sum(1 for name in markers if name.startswith(prefix))
-        if done_count == 0 and not markers:
-            # Run predates checkpoint markers: fall back to artifact presence.
-            return artifacts_exist, total if artifacts_exist else 0
-        return total > 0 and done_count >= total, done_count
-
-    s3_done, s3_count = marked("stage3-", au_total, findings_total > 0)
-    s4_done, s4_count = marked("stage4-", findings_total, vuln_total > 0)
-    s5_done, s5_count = marked("stage5-", vuln_total, vuln_total > 0)
-    disclosures_exist = (base / "stage6-disclosures").is_dir() and any(
-        (base / "stage6-disclosures").iterdir()
-    )
-    s6_done, s6_count = marked("stage6-", disclosures_total, disclosures_exist)
-
-    return [
-        entry(0, base.is_dir()),
-        entry(
-            1,
-            (
-                base / "stage1-security-context" / "stage-1-security-context.json"
-            ).is_file(),
-        ),
-        entry(2, "stage2" in markers or au_total > 0, au_total, au_total),
-        entry(3, s3_done, min(s3_count, au_total), au_total),
-        entry(4, s4_done, min(s4_count, findings_total), findings_total),
-        entry(5, s5_done, min(s5_count, vuln_total), vuln_total),
-        entry(6, s6_done, min(s6_count, disclosures_total), disclosures_total),
-    ]
 
 
 def _resolve_output_file(output_dir: str, rel_path: str) -> str:
@@ -491,52 +393,6 @@ def _safe_revision_component(value: object) -> str:
     return component.strip("-")[:40] or "previous"
 
 
-def _benchmark_dataset_roots(state_dir: str, repos_dir: str) -> list[Path]:
-    """Directories a Web-started benchmark may execute dataset scripts from."""
-    roots = [Path(state_dir) / "benchmarks", Path(repos_dir)]
-    extra = os.environ.get("CODE_AUDITOR_BENCH_ROOTS", "")
-    for part in extra.split(os.pathsep):
-        if part.strip():
-            roots.append(Path(os.path.expanduser(part.strip())).resolve())
-    return roots
-
-
-def _resolve_benchmark_dataset(
-    repo_dir: str, *, state_dir: str, repos_dir: str
-) -> str:
-    if "\x00" in repo_dir:
-        raise HTTPException(status_code=400, detail="Invalid dataset path.")
-    path = Path(os.path.expanduser(repo_dir)).resolve()
-    if not path.is_dir():
-        raise HTTPException(status_code=400, detail=f"Dataset directory not found: {path}")
-    roots = _benchmark_dataset_roots(state_dir, repos_dir)
-    if not any(path == root or path_is_within(path, root) for root in roots):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Benchmark datasets execute repository scripts. Keep them under "
-                f"{state_dir}/benchmarks or {repos_dir}, or list an allowed root "
-                "in CODE_AUDITOR_BENCH_ROOTS."
-            ),
-        )
-    return str(path)
-
-
-def _benchmark_output_dir(results_dir: str, benchmark: str) -> Path:
-    """Create a fresh managed output directory for one benchmark run."""
-    root = Path(results_dir) / "benchmarks"
-    root.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^a-z0-9_-]+", "-", benchmark.lower()).strip("-") or "benchmark"
-    for _attempt in range(5):
-        candidate = root / f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-        try:
-            candidate.mkdir()
-        except FileExistsError:
-            continue
-        return candidate
-    raise HTTPException(status_code=500, detail="Could not allocate a benchmark output directory.")
-
-
 def _tokens_match(provided: str, expected: str) -> bool:
     """Constant-time token comparison that tolerates non-ASCII input.
 
@@ -573,13 +429,6 @@ def _validate_http_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("URL must use http or https")
     return value
-
-
-class BenchStartRequest(StrictRequest):
-    benchmark: str = Field(min_length=1, max_length=64)
-    repo_dir: str | None = Field(default=None, max_length=4096)
-    max_turns: int = Field(default=100, ge=1, le=500)
-    capture_trajectory: bool = False
 
 
 class ImportRequest(StrictRequest):
@@ -788,25 +637,44 @@ def create_app(
                     )
             except Exception:
                 logger.exception("Failed to purge expired Disclosure trash records.")
+
+    async def _resume_interrupted_runs(run_ids: list[int]) -> None:
+        auto_resume = os.environ.get(
+            "CODE_AUDITOR_AUTO_RESUME_INTERRUPTED", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if not auto_resume:
+            return
+        provider = settings.provider()
+        for run_id in run_ids:
             try:
-                # Revoked/expired session digests are otherwise retained
-                # forever; bound the sessions table with the same cadence.
-                await asyncio.to_thread(store.purge_expired_auth_sessions)
+                await manager.resume_cancelled(
+                    run_id,
+                    repos_dir=settings.repos_dir,
+                    results_dir=settings.results_dir,
+                    wikis_dir=settings.wikis_dir,
+                    backend=settings.backend,  # type: ignore[arg-type]
+                    provider_mode=provider.mode,
+                    provider_base_url=provider.base_url or None,
+                    provider_api_key=provider.api_key or None,
+                    model=provider.model if provider.mode == "custom" else None,
+                    sandbox_mode=settings.sandbox_mode,
+                    sandbox_runtime=settings.sandbox_runtime,
+                )
+                logger.info("Automatically resumed interrupted audit run #%d.", run_id)
             except Exception:
-                logger.exception("Failed to purge expired authentication sessions.")
+                logger.exception(
+                    "Could not automatically resume interrupted audit run #%d.",
+                    run_id,
+                )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        manager.recover_interrupted_runs()
+        interrupted_run_ids = manager.recover_interrupted_runs()
+        await _resume_interrupted_runs(interrupted_run_ids)
         purge_task = asyncio.create_task(purge_disclosure_trash())
         try:
             yield
         finally:
-            bench_tasks = list(app.state.bench_tasks.values())
-            for task in bench_tasks:
-                task.cancel()
-            if bench_tasks:
-                await asyncio.gather(*bench_tasks, return_exceptions=True)
             await manager.shutdown()
             purge_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -822,82 +690,8 @@ def create_app(
     app.state.terminal_token = secrets.token_urlsafe(32)
     app.state.local_directory_selections = {}
     app.state.active_terminals = 0
-    app.state.bench_tasks = {}
-    app.state.bench_task_meta = {}
     # One process-wide log handler routes records to the owning job's bus.
     install_web_log_handler(manager.bus_for_job)
-
-    _AUTH_PUBLIC_PATHS = {
-        "/api/auth/status",
-        "/api/auth/setup",
-        "/api/auth/login",
-        "/api/auth/logout",
-    }
-
-    async def _session_user(request) -> dict[str, object] | None:
-        """Resolve the session cookie's user without blocking the event loop."""
-        token = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if not token:
-            return None
-        return await asyncio.to_thread(
-            store.get_auth_user_by_session, session_token_digest(token)
-        )
-
-    def _session_cookie(response: Response, token: str, *, secure: bool = False) -> None:
-        response.set_cookie(
-            SESSION_COOKIE_NAME,
-            token,
-            max_age=SESSION_TTL_SECONDS,
-            httponly=True,
-            samesite="lax",
-            # Mark the bearer cookie Secure whenever the request actually
-            # arrived over HTTPS (uvicorn's proxy handling maps forwarded
-            # schemes onto request.url.scheme). Plain-HTTP local deployments
-            # keep working.
-            secure=secure,
-            path="/",
-        )
-
-    def _clear_session_cookie(response: Response) -> None:
-        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
-
-    def _issue_session(user: dict[str, object]) -> str:
-        token = new_session_token()
-        now = time.time()
-        store.create_auth_session(
-            int(user["id"]),
-            session_token_digest(token),
-            created_at=now,
-            expires_at=now + SESSION_TTL_SECONDS,
-        )
-        return token
-
-    @app.middleware("http")
-    async def require_authentication(request, call_next):
-        """Require a session after first-run setup has created an account.
-
-        Existing installations remain usable until setup is completed; this
-        compatibility mode lets an operator reach ``/api/auth/setup`` without
-        a migration-time lockout.  Once any account exists, every API except
-        the explicitly public authentication endpoints requires a session
-        cookie — including user registration, which is an administrator
-        action (see the README) and not an open sign-up.
-        """
-        path = request.url.path
-        if path.startswith("/api/") and path not in _AUTH_PUBLIC_PATHS:
-            # Keep the blocking SQLite reads off the event loop: a locked
-            # writer (busy_timeout is 30s) would otherwise stall every SSE
-            # stream and concurrent job.
-            if await asyncio.to_thread(store.auth_user_count) > 0:
-                user = await _session_user(request)
-                if user is None:
-                    return JSONResponse(
-                        {"detail": "Authentication required."},
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Session"},
-                    )
-                request.state.user = user
-        return await call_next(request)
 
     def jobs_snapshot() -> list[dict]:
         """Combine Web-owned jobs with externally owned maintenance runs."""
@@ -984,8 +778,7 @@ def create_app(
         elif request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
         elif (
-            request.url.path.startswith("/api/auth/")
-            or request.url.path
+            request.url.path
             in {
                 "/api/config",
                 "/api/dashboard",
@@ -997,7 +790,6 @@ def create_app(
                 request.url.path.startswith("/api/")
                 and request.url.path.endswith("/sandbox-executions")
             )
-            or request.url.path.startswith("/api/bench/")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -1007,109 +799,6 @@ def create_app(
         return FileResponse(STATIC_DIR / "index.html")
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-    @app.get("/api/auth/status")
-    async def auth_status(request: Request) -> dict[str, object]:
-        user = await _session_user(request)
-        return {
-            # Keep the SQLite read off the event loop; see the auth middleware.
-            "setup_required": await asyncio.to_thread(store.auth_user_count) == 0,
-            "authenticated": user is not None,
-            "user": user,
-        }
-
-    @app.post("/api/auth/setup", status_code=201)
-    def auth_setup(
-        credentials: AuthCredentialsRequest, request: Request, response: Response
-    ) -> dict[str, object]:
-        if store.auth_user_count() > 0:
-            raise HTTPException(
-                status_code=409,
-                detail="Administrator setup has already been completed.",
-            )
-        username = normalize_username(credentials.username)
-        try:
-            user = store.create_initial_auth_admin(
-                username, hash_password(credentials.password)
-            )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="Administrator setup has already been completed.",
-            ) from exc
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(
-                status_code=409, detail="That username is already registered."
-            ) from exc
-        # A pre-setup /api/config response may have exposed the old process
-        # token. Rotate it as soon as authentication is initialized.
-        app.state.terminal_token = secrets.token_urlsafe(32)
-        _session_cookie(
-            response,
-            _issue_session(user),
-            secure=request.url.scheme == "https",
-        )
-        return {"user": user, "setup_required": False}
-
-    @app.post("/api/auth/register", status_code=201)
-    def auth_register(
-        credentials: AuthCredentialsRequest, request: Request
-    ) -> dict[str, object]:
-        if store.auth_user_count() == 0:
-            raise HTTPException(
-                status_code=409,
-                detail="Complete administrator setup before registering users.",
-            )
-        # Registration creates credentials, so it is an administrator action.
-        # Leaving it public lets any network client mint itself an account and
-        # reach every other API; the middleware above requires the session.
-        actor = getattr(request.state, "user", None)
-        if actor is None or str(actor.get("role") or "") != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Administrator authentication is required to register users.",
-            )
-        username = normalize_username(credentials.username)
-        try:
-            user = store.create_auth_user(
-                username, hash_password(credentials.password), role="user"
-            )
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(
-                status_code=409, detail="That username is already registered."
-            ) from exc
-        return {"user": user}
-
-    @app.post("/api/auth/login")
-    def auth_login(
-        credentials: AuthCredentialsRequest, request: Request, response: Response
-    ) -> dict[str, object]:
-        username = normalize_username(credentials.username)
-        record = store.get_auth_user_by_username(username)
-        if (
-            record is None
-            or not bool(record.get("is_active"))
-            or not verify_password(credentials.password, str(record["password_hash"]))
-        ):
-            raise HTTPException(status_code=401, detail="Invalid username or password.")
-        user = {key: value for key, value in record.items() if key != "password_hash"}
-        store.mark_auth_login(int(user["id"]))
-        user = store.get_auth_user_by_username(username) or record
-        user.pop("password_hash", None)
-        _session_cookie(
-            response,
-            _issue_session(user),
-            secure=request.url.scheme == "https",
-        )
-        return {"user": AuditStore._public_user(user)}
-
-    @app.post("/api/auth/logout")
-    def auth_logout(request: Request, response: Response) -> dict[str, bool]:
-        token = request.cookies.get(SESSION_COOKIE_NAME, "")
-        if token:
-            store.revoke_auth_session(session_token_digest(token))
-        _clear_session_cookie(response)
-        return {"logged_out": True}
 
     @app.get("/api/config")
     def get_config() -> dict:
@@ -1315,6 +1004,7 @@ def create_app(
                     update_repo=not bool(request.local_directory),
                     wiki=wiki_path,
                     max_parallel=request.max_parallel,
+                    full_analysis=request.full_analysis,
                     backend=settings.backend,
                     model=provider.model if provider.mode == "custom" else None,
                     provider_mode=provider.mode,
@@ -1998,7 +1688,7 @@ def create_app(
         for path in sorted(base.rglob("*.json")):
             if path == root_path or not path.is_file():
                 continue
-            relative = str(path.relative_to(base))
+            relative = path.relative_to(base).as_posix()
             try:
                 size = path.stat().st_size
             except OSError:
@@ -2051,213 +1741,6 @@ def create_app(
         return _output_file_response(
             _get_history_run(run_id)["output_dir"], path, download
         )
-
-    # ── Benchmark runs ───────────────────────────────────────────────────
-
-    @app.get("/api/bench/adapters")
-    def list_benchmark_adapters() -> dict:
-        return {"adapters": registered_benchmarks()}
-
-    @app.post("/api/bench/runs", status_code=202)
-    async def start_benchmark_run(request: BenchStartRequest) -> dict:
-        benchmark = request.benchmark.strip().lower()
-        if benchmark not in registered_benchmarks():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown benchmark adapter: {request.benchmark}",
-            )
-        if benchmark in app.state.bench_task_meta.values():
-            raise HTTPException(
-                status_code=409,
-                detail=f"A {benchmark} benchmark run is already active.",
-            )
-        repo_dir = ""
-        if benchmark != "tsecbench":
-            if not request.repo_dir or not request.repo_dir.strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail="This benchmark needs a local dataset directory.",
-                )
-            repo_dir = _resolve_benchmark_dataset(
-                request.repo_dir,
-                state_dir=settings.state_dir,
-                repos_dir=settings.repos_dir,
-            )
-
-        output_dir = _benchmark_output_dir(settings.results_dir, benchmark)
-        options: dict[str, object] = {}
-        if benchmark != "tsecbench":
-            options["repo_dir"] = repo_dir
-            options["work_root"] = output_dir / "work"
-        try:
-            adapter = create_benchmark_adapter(benchmark, **options)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not initialize the benchmark adapter: {exc}",
-            ) from exc
-
-        provider = settings.provider()
-        config = AuditConfig(
-            target=repo_dir or benchmark,
-            output_dir=str(output_dir),
-            backend=settings.backend,
-            model=provider.model if provider.mode == "custom" else None,
-            provider_mode=provider.mode,
-            provider_base_url=provider.base_url or None,
-            provider_api_key=provider.api_key or None,
-            max_parallel=1,
-            log_level=settings.log_level,
-            sandbox_enabled=False,
-            trajectory_enabled=request.capture_trajectory,
-        )
-        try:
-            run_id = await asyncio.to_thread(
-                store.create_bench_run,
-                benchmark=benchmark,
-                adapter=type(adapter).__name__,
-                repo_dir=repo_dir,
-                output_dir=str(output_dir),
-                backend=config.backend,
-                model=config.model,
-                started_at=time.time(),
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500, detail=f"Could not record the benchmark run: {exc}"
-            ) from exc
-
-        try:
-            runner = BenchRunner(
-                adapter,
-                config,
-                output_dir=output_dir,
-                max_turns=request.max_turns,
-                capture_trajectory=request.capture_trajectory,
-                store=store,
-                db_run_id=run_id,
-            )
-        except Exception as exc:
-            with suppress(Exception):
-                await asyncio.to_thread(
-                    store.finish_bench_run,
-                    run_id,
-                    status=RUN_FAILED,
-                    error=f"{type(exc).__name__}: {exc}"[:2000],
-                )
-            raise HTTPException(
-                status_code=500, detail=f"Could not initialize the benchmark runner: {exc}"
-            ) from exc
-
-        async def run_benchmark() -> None:
-            try:
-                await runner.run()
-            except asyncio.CancelledError:
-                with suppress(Exception):
-                    await asyncio.to_thread(
-                        store.finish_bench_run,
-                        run_id,
-                        status=RUN_CANCELLED,
-                        error="cancelled",
-                    )
-                raise
-            except Exception as exc:
-                logger.exception("Benchmark run %s failed", run_id)
-                with suppress(Exception):
-                    await asyncio.to_thread(
-                        store.finish_bench_run,
-                        run_id,
-                        status=RUN_FAILED,
-                        error=f"{type(exc).__name__}: {exc}"[:2000],
-                    )
-            finally:
-                app.state.bench_tasks.pop(run_id, None)
-                app.state.bench_task_meta.pop(run_id, None)
-
-        task = asyncio.create_task(run_benchmark())
-        app.state.bench_tasks[run_id] = task
-        app.state.bench_task_meta[run_id] = benchmark
-
-        def forget_benchmark_task(_task: asyncio.Task) -> None:
-            app.state.bench_tasks.pop(run_id, None)
-            app.state.bench_task_meta.pop(run_id, None)
-
-        task.add_done_callback(forget_benchmark_task)
-        return {
-            "run_id": run_id,
-            "benchmark": benchmark,
-            "status": RUN_RUNNING,
-            "output_dir": str(output_dir),
-        }
-
-    @app.get("/api/bench/runs")
-    def list_benchmark_runs(
-        limit: int = Query(default=50, ge=1, le=200),
-        offset: int = Query(default=0, ge=0),
-        status: str | None = Query(default=None, max_length=32),
-        benchmark: str | None = Query(default=None, max_length=64),
-        q: str | None = Query(default=None, max_length=256),
-    ) -> dict:
-        try:
-            runs, total = store.list_bench_runs(
-                limit=limit,
-                offset=offset,
-                status=status or None,
-                benchmark=benchmark or None,
-                query=q or None,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"runs": runs, "total": total, "limit": limit, "offset": offset}
-
-    @app.post("/api/bench/runs/{run_id}/cancel", status_code=202)
-    async def cancel_benchmark_run(run_id: int) -> dict:
-        task = app.state.bench_tasks.get(run_id)
-        if task is None:
-            run = await asyncio.to_thread(store.get_bench_run, run_id)
-            if run is None:
-                raise HTTPException(status_code=404, detail="Benchmark run not found.")
-            if run.get("status") != RUN_RUNNING:
-                raise HTTPException(
-                    status_code=409, detail="Benchmark run is not running."
-                )
-            # The process restarted and lost the task; finalize the stale row.
-            await asyncio.to_thread(
-                store.finish_bench_run,
-                run_id,
-                status=RUN_CANCELLED,
-                error="cancelled by operator (no active task)",
-            )
-            return {"run_id": run_id, "status": RUN_CANCELLED}
-        if task.done() or not task.cancel():
-            raise HTTPException(
-                status_code=409, detail="Benchmark run is already finishing."
-            )
-        await asyncio.to_thread(
-            store.finish_bench_run,
-            run_id,
-            status=RUN_CANCELLED,
-            error="cancelled by operator",
-        )
-        return {"run_id": run_id, "status": "cancelling"}
-
-    @app.get("/api/bench/runs/{run_id}")
-    def get_benchmark_run(run_id: int) -> dict:
-        run = store.get_bench_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Benchmark run not found.")
-        return run
-
-    @app.get("/api/bench/runs/{run_id}/file")
-    def benchmark_run_file(
-        run_id: int,
-        path: str = Query(min_length=1, max_length=4096),
-        download: bool = Query(default=False),
-    ):
-        run = store.get_bench_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Benchmark run not found.")
-        return _output_file_response(run["output_dir"], path, download)
 
     @app.post("/api/history/import", status_code=201)
     def import_history(request: ImportRequest) -> dict:

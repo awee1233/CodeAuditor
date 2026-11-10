@@ -20,18 +20,6 @@ const STATUS_LABEL = {
 
 // ── DOM handles ─────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
-const authLoading = $("auth-loading");
-const authGate = $("auth-gate");
-const appShell = $("app-shell");
-const authSetupPanel = $("auth-setup-panel");
-const authLoginPanel = $("auth-login-panel");
-const authRegisterPanel = $("auth-register-panel");
-const authError = $("auth-error");
-const authSwitch = $("auth-switch");
-const authSwitchCopy = $("auth-switch-copy");
-const authSwitchButton = $("auth-switch-button");
-const authUserMenu = $("auth-user-menu");
-const authUserLabel = $("auth-user-label");
 const form = $("audit-form");
 const logPane = $("log-pane");
 const jobList = $("job-list");
@@ -932,6 +920,7 @@ form.addEventListener("submit", async (e) => {
     return;
   }
   body.max_parallel = maxParallel;
+  body.full_analysis = $("f-full-analysis").checked;
   const wiki = $("f-wiki-select").value;
   if (wiki) body.wiki = wiki;
 
@@ -2081,6 +2070,364 @@ async function viewLatestAgentLog(preferReproduction = false) {
 $("btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(false));
 $("r-btn-full-agent-log").addEventListener("click", () => viewLatestAgentLog(true));
 
+const trajectoryView = {
+  runId: null,
+  index: null,
+  document: null,
+  documentPath: "__root__",
+  selectedStepId: null,
+  actualTime: true,
+  expanded: false,
+  query: "",
+  cache: new Map(),
+};
+
+function trajectoryContentText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => trajectoryContentText(item)).filter(Boolean).join("\n");
+  }
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.content === "string") return value.content;
+    if (typeof value.message === "string") return value.message;
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function trajectoryPretty(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function trajectoryPreview(value, limit = 150) {
+  const text = trajectoryContentText(value).replace(/\s+/g, " ").trim();
+  if (!text) return "—";
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function trajectoryStepKind(step) {
+  const source = String(step?.source || "agent").toLowerCase();
+  if (source === "agent" && Array.isArray(step.tool_calls) && step.tool_calls.length) {
+    return "tool";
+  }
+  return ["user", "system", "agent"].includes(source) ? source : "agent";
+}
+
+function trajectoryStepLabel(step) {
+  const tools = Array.isArray(step?.tool_calls) ? step.tool_calls : [];
+  if (tools.length) {
+    return tools.map((call) => call.function_name || "tool").join(", ");
+  }
+  const message = trajectoryContentText(step?.message);
+  if (message) return trajectoryPreview(message, 90);
+  return step?.source === "system" ? "system event" : "agent step";
+}
+
+function trajectoryStepSearchText(step) {
+  return JSON.stringify(step || {}).toLowerCase();
+}
+
+function trajectoryDurationMs(step) {
+  const metrics = step?.metrics;
+  const extra = metrics && typeof metrics === "object" ? metrics.extra : null;
+  for (const value of [extra?.duration_ms, metrics?.duration_ms]) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+  }
+  return 0;
+}
+
+function trajectoryTimestampMs(step) {
+  const value = Date.parse(String(step?.timestamp || ""));
+  return Number.isFinite(value) ? value : null;
+}
+
+function trajectoryDocumentStats(document) {
+  const steps = Array.isArray(document?.steps) ? document.steps : [];
+  const toolCalls = steps.reduce(
+    (count, step) => count + (Array.isArray(step.tool_calls) ? step.tool_calls.length : 0),
+    0,
+  );
+  const metrics = document?.final_metrics && typeof document.final_metrics === "object"
+    ? document.final_metrics
+    : {};
+  const tokens = Number(metrics.total_prompt_tokens || 0) + Number(metrics.total_completion_tokens || 0);
+  const cost = Number(metrics.total_cost_usd || 0);
+  return { steps: steps.length, toolCalls, tokens, cost };
+}
+
+function trajectoryTimingRows(steps) {
+  const timestamps = steps.map(trajectoryTimestampMs);
+  const valid = trajectoryView.actualTime && timestamps.every((value) => value !== null);
+  if (!valid) {
+    return steps.map((_step, index) => ({
+      start: index,
+      end: index + 1,
+      duration: 1,
+    }));
+  }
+  const starts = timestamps.slice();
+  const durations = steps.map(trajectoryDurationMs);
+  const ends = starts.map((start, index) => {
+    if (durations[index] > 0) return start + durations[index];
+    const next = starts[index + 1];
+    return next !== undefined && next > start ? next : start + 1;
+  });
+  return starts.map((start, index) => ({
+    start,
+    end: Math.max(ends[index], start + 1),
+    duration: Math.max(ends[index] - start, 1),
+  }));
+}
+
+function renderTrajectoryStats(document) {
+  const stats = trajectoryDocumentStats(document);
+  const chips = [
+    `${stats.steps} steps`,
+    `${stats.toolCalls} tools`,
+    `${stats.tokens.toLocaleString()} tokens`,
+  ];
+  if (stats.cost > 0) chips.push(`$${stats.cost.toFixed(4)}`);
+  const runtime = document?.final_metrics?.wall_time_seconds;
+  if (typeof runtime === "number" && runtime > 0) chips.push(`${runtime.toFixed(1)}s`);
+  $("trajectory-stats").innerHTML = chips
+    .map((text) => `<span class="trajectory-stat">${escapeHtml(text)}</span>`)
+    .join("");
+}
+
+function renderTrajectoryTimeline(document) {
+  const timeline = $("trajectory-timeline");
+  const steps = Array.isArray(document?.steps) ? document.steps : [];
+  if (!steps.length) {
+    timeline.innerHTML = '<div class="trajectory-empty">No trajectory steps.</div>';
+    return;
+  }
+  const rows = trajectoryTimingRows(steps);
+  const domainStart = Math.min(...rows.map((row) => row.start));
+  const domainEnd = Math.max(...rows.map((row) => row.end));
+  const domain = Math.max(domainEnd - domainStart, 1);
+  timeline.innerHTML = rows
+    .map((row, index) => {
+      const step = steps[index];
+      const kind = trajectoryStepKind(step);
+      const left = ((row.start - domainStart) / domain) * 100;
+      const width = Math.max((row.duration / domain) * 100, 0.6);
+      const title = `${trajectoryStepLabel(step)} · ${row.duration}${trajectoryView.actualTime ? "ms" : " slot"}`;
+      return `
+        <div class="trajectory-time-row">
+          <span class="trajectory-time-label" title="${escapeHtml(trajectoryStepLabel(step))}">
+            #${step.step_id || index + 1} ${escapeHtml(step.source || "agent")}
+          </span>
+          <span class="trajectory-time-track">
+            <button type="button" class="trajectory-time-span source-${kind} ${Array.isArray(step.tool_calls) && step.tool_calls.length ? "has-tools" : ""} ${trajectoryView.selectedStepId === step.step_id ? "is-selected" : ""}"
+                    data-trajectory-step="${escapeHtml(String(step.step_id || index + 1))}"
+                    style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"
+                    title="${escapeHtml(title)}"></button>
+          </span>
+        </div>`;
+    })
+    .join("");
+}
+
+function renderTrajectoryLedger(document) {
+  const ledger = $("trajectory-ledger");
+  const steps = Array.isArray(document?.steps) ? document.steps : [];
+  const query = trajectoryView.query.trim().toLowerCase();
+  const visible = steps.filter((step) => !query || trajectoryStepSearchText(step).includes(query));
+  if (!visible.length) {
+    ledger.innerHTML = `<div class="trajectory-empty">${steps.length ? "No matching steps." : "No trajectory steps."}</div>`;
+    return;
+  }
+  ledger.innerHTML = "";
+  for (const step of visible) {
+    const stepId = Number(step.step_id || 0);
+    const kind = trajectoryStepKind(step);
+    const tools = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+    const results = Array.isArray(step.observation?.results) ? step.observation.results : [];
+    const metrics = step.metrics && typeof step.metrics === "object" ? step.metrics : {};
+    const tokenCount = Number(metrics.prompt_tokens || 0) + Number(metrics.completion_tokens || 0);
+    const duration = trajectoryDurationMs(step);
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `trajectory-row ${trajectoryView.selectedStepId === stepId ? "is-selected" : ""}`;
+    row.dataset.trajectoryStep = String(stepId);
+    row.setAttribute("role", "listitem");
+    row.innerHTML = `
+      <span class="trajectory-index">#${stepId}</span>
+      <span class="trajectory-kind trajectory-kind-${kind}">${escapeHtml(kind)}</span>
+      <span class="trajectory-row-main">
+        <span class="trajectory-row-title">${escapeHtml(trajectoryStepLabel(step))}</span>
+        <span class="trajectory-row-preview">${escapeHtml(trajectoryPreview(step.message || tools.map((call) => call.arguments) || results.map((result) => result.content)))}</span>
+      </span>
+      <span class="trajectory-row-meta">${duration ? `${duration}ms` : ""}${duration && tokenCount ? " · " : ""}${tokenCount ? `${tokenCount} tok` : ""}</span>`;
+    ledger.appendChild(row);
+    for (const call of tools) {
+      const subrow = document.createElement("div");
+      subrow.className = `trajectory-subrow ${trajectoryView.expanded || query ? "" : "is-hidden"}`;
+      subrow.innerHTML = `<span>└</span><strong>${escapeHtml(call.function_name || "tool")}</strong><span>${escapeHtml(trajectoryPreview(call.arguments, 110))}</span>`;
+      ledger.appendChild(subrow);
+    }
+  }
+}
+
+function renderTrajectoryInspector() {
+  const inspector = $("trajectory-inspector");
+  const step = Array.isArray(trajectoryView.document?.steps)
+    ? trajectoryView.document.steps.find((item) => item.step_id === trajectoryView.selectedStepId)
+    : null;
+  if (!step) {
+    inspector.innerHTML = '<div class="trajectory-inspector-empty">Select a step to inspect its message, tool calls, results, and metrics.</div>';
+    return;
+  }
+  const tools = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+  const results = Array.isArray(step.observation?.results) ? step.observation.results : [];
+  const meta = [
+    `step ${step.step_id}`,
+    step.source || "agent",
+    step.timestamp || "no timestamp",
+    trajectoryDurationMs(step) ? `${trajectoryDurationMs(step)}ms` : "duration unknown",
+  ];
+  inspector.innerHTML = `
+    <div class="trajectory-inspector-header">
+      <h3>Step #${escapeHtml(String(step.step_id || "?"))}</h3>
+      <span class="trajectory-kind trajectory-kind-${trajectoryStepKind(step)}">${escapeHtml(step.source || "agent")}</span>
+    </div>
+    <div class="trajectory-inspector-meta">
+      ${meta.map((text) => `<span class="trajectory-stat">${escapeHtml(text)}</span>`).join("")}
+    </div>
+    ${step.message ? `<section class="trajectory-inspector-section"><h4>Message</h4><pre>${escapeHtml(trajectoryPretty(step.message))}</pre></section>` : ""}
+    ${step.reasoning_content ? `<section class="trajectory-inspector-section"><h4>Reasoning</h4><pre>${escapeHtml(trajectoryPretty(step.reasoning_content))}</pre></section>` : ""}
+    ${tools.length ? `<section class="trajectory-inspector-section"><h4>Tool calls</h4>${tools.map((call) => `<div class="trajectory-tool-card"><strong>${escapeHtml(call.function_name || "tool")}</strong><pre>${escapeHtml(trajectoryPretty(call.arguments || {}))}</pre></div>`).join("")}</section>` : ""}
+    ${results.length ? `<section class="trajectory-inspector-section"><h4>Results</h4>${results.map((result) => `<pre>${escapeHtml(trajectoryPretty(result.content ?? result))}</pre>`).join("")}</section>` : ""}
+    ${step.metrics ? `<section class="trajectory-inspector-section"><h4>Metrics</h4><pre>${escapeHtml(trajectoryPretty(step.metrics))}</pre></section>` : ""}
+    ${step.extra ? `<section class="trajectory-inspector-section"><h4>Extra</h4><pre>${escapeHtml(trajectoryPretty(step.extra))}</pre></section>` : ""}
+  `;
+}
+
+function renderTrajectoryDocument() {
+  renderTrajectoryStats(trajectoryView.document);
+  renderTrajectoryTimeline(trajectoryView.document);
+  renderTrajectoryLedger(trajectoryView.document);
+  renderTrajectoryInspector();
+}
+
+function selectTrajectoryStep(stepId) {
+  trajectoryView.selectedStepId = Number(stepId);
+  renderTrajectoryTimeline(trajectoryView.document);
+  renderTrajectoryLedger(trajectoryView.document);
+  renderTrajectoryInspector();
+}
+
+async function loadTrajectoryDocument(path) {
+  const runId = trajectoryView.runId;
+  if (path === "__root__") return trajectoryView.index?.root || null;
+  const key = `${runId}:${path}`;
+  if (trajectoryView.cache.has(key)) return trajectoryView.cache.get(key);
+  const filePath = `trajectories/${path}`;
+  const res = await fetch(
+    `/api/history/${encodeURIComponent(runId)}/file?path=${encodeURIComponent(filePath)}`,
+    { cache: "no-store" },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const document = JSON.parse(await res.text());
+  trajectoryView.cache.set(key, document);
+  return document;
+}
+
+async function showTrajectoryDocument(path) {
+  trajectoryView.documentPath = path;
+  trajectoryView.selectedStepId = null;
+  trajectoryView.document = await loadTrajectoryDocument(path);
+  renderTrajectoryDocument();
+}
+
+async function loadTrajectoryVisualization(runId) {
+  const panel = $("trajectory-visualizer-panel");
+  trajectoryView.runId = String(runId);
+  trajectoryView.index = null;
+  trajectoryView.document = null;
+  trajectoryView.selectedStepId = null;
+  trajectoryView.cache.clear();
+  try {
+    const res = await fetch(`/api/history/${encodeURIComponent(runId)}/trajectory`, {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const index = await res.json();
+    const children = Array.isArray(index.children) ? index.children : [];
+    if (!index.root && !children.length) {
+      panel.hidden = true;
+      return;
+    }
+    trajectoryView.index = index;
+    const select = $("trajectory-document-select");
+    select.innerHTML = "";
+    if (index.root) {
+      select.appendChild(new Option("Run overview · trajectory.json", "__root__"));
+    }
+    for (const child of children) {
+      const suffix = child.valid === false ? " · invalid" : child.steps ? ` · ${child.steps} steps` : "";
+      select.appendChild(new Option(`${child.path}${suffix}`, child.path));
+    }
+    const first = index.root ? "__root__" : children[0]?.path;
+    if (!first) {
+      panel.hidden = true;
+      return;
+    }
+    select.value = first;
+    await showTrajectoryDocument(first);
+    panel.hidden = false;
+  } catch {
+    panel.hidden = true;
+  }
+}
+
+$("trajectory-document-select")?.addEventListener("change", async (event) => {
+  try {
+    await showTrajectoryDocument(event.target.value);
+  } catch (error) {
+    $("trajectory-ledger").innerHTML = `<div class="trajectory-empty">Could not load trajectory: ${escapeHtml(String(error))}</div>`;
+  }
+});
+
+$("trajectory-search")?.addEventListener("input", (event) => {
+  trajectoryView.query = String(event.target.value || "");
+  renderTrajectoryLedger(trajectoryView.document);
+});
+
+$("trajectory-actual-time")?.addEventListener("change", (event) => {
+  trajectoryView.actualTime = Boolean(event.target.checked);
+  renderTrajectoryTimeline(trajectoryView.document);
+});
+
+$("btn-trajectory-expand")?.addEventListener("click", (event) => {
+  trajectoryView.expanded = !trajectoryView.expanded;
+  event.currentTarget.textContent = trajectoryView.expanded ? "Collapse all" : "Expand all";
+  renderTrajectoryLedger(trajectoryView.document);
+});
+
+$("btn-trajectory-refresh")?.addEventListener("click", () => {
+  if (trajectoryView.runId) void loadTrajectoryVisualization(trajectoryView.runId);
+});
+
+$("trajectory-ledger")?.addEventListener("click", (event) => {
+  const row = event.target.closest("[data-trajectory-step]");
+  if (row) selectTrajectoryStep(row.dataset.trajectoryStep);
+});
+
+$("trajectory-timeline")?.addEventListener("click", (event) => {
+  const span = event.target.closest("[data-trajectory-step]");
+  if (span) selectTrajectoryStep(span.dataset.trajectoryStep);
+});
+
 async function loadRunResults(run) {
   const viewer = (path) => viewHistoryFile(run.id, path);
   try {
@@ -2094,8 +2441,10 @@ async function loadRunResults(run) {
     fillFileList("results-agent-logs", data.agent_logs, viewer);
     fillFileList("results-trajectories", data.trajectories, viewer);
     resultsPanel.hidden = false;
+    await loadTrajectoryVisualization(run.id);
   } catch {
     resultsPanel.hidden = true;
+    $("trajectory-visualizer-panel").hidden = true;
   }
 }
 
@@ -2736,6 +3085,7 @@ async function loadRunDetail(runId) {
 
 async function reloadRunDetail(runId) {
   stopAuditProcessTree();
+  $("trajectory-visualizer-panel").hidden = true;
   const resumeButton = $("btn-run-resume");
   resumeButton.hidden = true;
   resumeButton.dataset.resumeRun = "";
@@ -2803,6 +3153,7 @@ async function reloadRunDetail(runId) {
       `/api/history/${run.id}/agent-log?download=true`;
     resultsPanel.hidden = true;
     viewerPanel.hidden = true;
+    void loadTrajectoryVisualization(run.id);
     if (status.state === "running") startAuditProcessTree(run.id);
     connectDetailEvents(run.id);
   } else {
@@ -5043,306 +5394,14 @@ $("btn-terminal-dock-close").addEventListener("click", () => {
 });
 setupTerminalSplitter();
 
-// ── Benchmarks ─────────────────────────────────────────────────────────────
-
-let benchmarkDetailTimer = null;
-
-function benchStatusBadge(status) {
-  const safe = String(status || "unknown").replace(/[^a-z_-]/g, "");
-  const span = document.createElement("span");
-  span.className = `badge badge-${safe}`;
-  span.textContent = status || "unknown";
-  return span;
-}
-
-function benchCell(row, text) {
-  const cell = document.createElement("td");
-  cell.textContent = text === null || text === undefined || text === "" ? "—" : String(text);
-  row.appendChild(cell);
-  return cell;
-}
-
-function updateBenchmarkRepoField() {
-  const select = $("benchmark-start-adapter");
-  const repo = $("benchmark-start-repo");
-  if (!select || !repo) return;
-  const tsec = select.value === "tsecbench";
-  repo.disabled = tsec;
-  repo.required = !tsec;
-  repo.placeholder = tsec
-    ? "Not used for TSECBench (platform API + VPN)"
-    : "~/.code_auditor/benchmarks/CTFTiny or an allowed root";
-}
-
-async function loadBenchmarkAdapters() {
-  const select = $("benchmark-start-adapter");
-  if (!select) return;
-  try {
-    const res = await fetch("/api/bench/adapters", { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const current = select.value;
-    select.innerHTML = "";
-    for (const name of data.adapters || []) {
-      const option = document.createElement("option");
-      option.value = name;
-      option.textContent = name;
-      select.appendChild(option);
-    }
-    if ([...select.options].some((option) => option.value === current)) {
-      select.value = current;
-    }
-    updateBenchmarkRepoField();
-  } catch (error) {
-    $("benchmark-start-message").textContent = `Could not load adapters: ${error}`;
-  }
-}
-
-$("benchmark-start-adapter")?.addEventListener("change", updateBenchmarkRepoField);
-$("benchmark-start-form")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const benchmark = $("benchmark-start-adapter").value;
-  const repo = $("benchmark-start-repo").value.trim();
-  const maxTurns = Number($("benchmark-start-turns").value || 100);
-  const capture = $("benchmark-start-trajectory").checked;
-  const message = $("benchmark-start-message");
-  const button = $("btn-benchmark-start");
-  if (!benchmark) {
-    message.textContent = "Select a benchmark adapter.";
-    return;
-  }
-  if (benchmark !== "tsecbench" && !repo) {
-    message.textContent = "This adapter needs a dataset directory.";
-    return;
-  }
-  const payload = {
-    benchmark,
-    max_turns: maxTurns,
-    capture_trajectory: capture,
-  };
-  if (benchmark !== "tsecbench") payload.repo_dir = repo;
-  button.disabled = true;
-  message.textContent = `Starting ${benchmark}…`;
-  try {
-    const res = await fetch("/api/bench/runs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-    message.textContent = `Run #${data.run_id} started.`;
-    location.hash = `#/benchmark/${encodeURIComponent(data.run_id)}`;
-  } catch (error) {
-    message.textContent = `Could not start: ${error}`;
-  } finally {
-    button.disabled = false;
-  }
-});
-
-async function cancelBenchmarkRun(runId) {
-  const res = await fetch(
-    `/api/bench/runs/${encodeURIComponent(runId)}/cancel`,
-    { method: "POST" }
-  );
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-  return data;
-}
-
-async function loadBenchmarks() {
-  loadBenchmarkAdapters();
-  updateBenchmarkRepoField();
-  const message = $("benchmarks-message");
-  const tbody = document.querySelector("#benchmarks-table tbody");
-  if (!tbody) return;
-  message.textContent = "Loading benchmark runs…";
-  tbody.innerHTML = "";
-  const params = new URLSearchParams();
-  const query = $("benchmarks-search").value.trim();
-  const status = $("benchmarks-status").value;
-  if (query) params.set("q", query);
-  if (status) params.set("status", status);
-  try {
-    const res = await fetch(`/api/bench/runs?${params.toString()}`, { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    for (const run of data.runs || []) {
-      const row = document.createElement("tr");
-      benchCell(row, run.id);
-      benchCell(row, run.benchmark);
-      const statusCell = document.createElement("td");
-      statusCell.appendChild(benchStatusBadge(run.status));
-      row.appendChild(statusCell);
-      benchCell(row, run.total_instances);
-      benchCell(row, run.succeeded);
-      benchCell(row, run.failed);
-      benchCell(row, run.errors);
-      benchCell(row, Number(run.score || 0));
-      benchCell(row, run.model);
-      benchCell(row, fmtTime(run.started_at));
-      const action = document.createElement("td");
-      const link = document.createElement("a");
-      link.href = `#/benchmark/${encodeURIComponent(run.id)}`;
-      link.textContent = "Open";
-      action.appendChild(link);
-      if (run.status === "running") {
-        const stop = document.createElement("button");
-        stop.type = "button";
-        stop.className = "btn btn-compact btn-stop";
-        stop.textContent = "Stop";
-        stop.addEventListener("click", async (event) => {
-          event.preventDefault();
-          stop.disabled = true;
-          try {
-            await cancelBenchmarkRun(run.id);
-            $("benchmarks-message").textContent = `Stopping run #${run.id}…`;
-            setTimeout(loadBenchmarks, 1200);
-          } catch (error) {
-            $("benchmarks-message").textContent = `Could not stop run #${run.id}: ${error}`;
-            stop.disabled = false;
-          }
-        });
-        action.appendChild(stop);
-      }
-      row.appendChild(action);
-      tbody.appendChild(row);
-    }
-    $("benchmarks-count").textContent = `${data.total || 0} run(s)`;
-    message.textContent = (data.runs || []).length ? "" : "No benchmark runs recorded yet.";
-  } catch (error) {
-    message.textContent = `Could not load benchmark runs: ${error}`;
-  }
-}
-
-async function loadBenchmarkDetail(runId) {
-  const message = $("benchmark-detail-message");
-  const meta = $("benchmark-detail-meta");
-  const tbody = document.querySelector("#benchmark-results-table tbody");
-  message.textContent = "Loading benchmark run…";
-  meta.innerHTML = "";
-  tbody.innerHTML = "";
-  $("benchmark-log-panel").hidden = true;
-  try {
-    const res = await fetch(`/api/bench/runs/${encodeURIComponent(runId)}`, { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const run = await res.json();
-    $("benchmark-detail-title").textContent = `Benchmark Run #${run.id} · ${run.benchmark}`;
-    const values = [
-      ["Benchmark", run.benchmark],
-      ["Adapter", run.adapter],
-      ["Status", run.status],
-      ["Backend", run.backend],
-      ["Model", run.model],
-      ["Started", fmtTime(run.started_at)],
-      ["Duration", fmtDurationSeconds(run.duration_seconds)],
-      ["Instances", run.total_instances],
-      ["Succeeded", run.succeeded],
-      ["Failed", run.failed],
-      ["Errors", run.errors],
-      ["Score", Number(run.score || 0)],
-      ["Success rate", `${Math.round(Number(run.success_rate || 0) * 100)}%`],
-      ["Repository", run.repo_dir],
-      ["Output", run.output_dir],
-      ["Error", run.error],
-    ];
-    meta.innerHTML = values
-      .map(([label, value]) =>
-        `<div class="meta-key">${escapeHtml(label)}</div>` +
-        `<div>${escapeHtml(value === null || value === undefined || value === "" ? "—" : String(value))}</div>`
-      )
-      .join("");
-    for (const item of run.results || []) {
-      const row = document.createElement("tr");
-      benchCell(row, item.instance_id);
-      const statusCell = document.createElement("td");
-      statusCell.appendChild(benchStatusBadge(item.status));
-      row.appendChild(statusCell);
-      benchCell(row, item.success === true ? "yes" : item.success === false ? "no" : "—");
-      benchCell(row, Number(item.score || 0));
-      benchCell(row, item.extracted ? "yes" : "no");
-      benchCell(row, fmtDurationSeconds(item.duration_seconds));
-      benchCell(row, item.error || item.cleanup_error);
-      const action = document.createElement("td");
-      if (item.agent_log) {
-        const link = document.createElement("a");
-        link.href = "#";
-        link.textContent = "View log";
-        link.addEventListener("click", (event) => {
-          event.preventDefault();
-          viewBenchmarkLog(run.id, item.agent_log);
-        });
-        action.appendChild(link);
-      } else {
-        action.textContent = "—";
-      }
-      row.appendChild(action);
-      tbody.appendChild(row);
-    }
-    message.textContent = (run.results || []).length ? "" : "No instance results recorded yet.";
-    const stop = $("btn-benchmark-stop");
-    stop.hidden = run.status !== "running";
-    stop.disabled = false;
-    stop.onclick = async () => {
-      stop.disabled = true;
-      try {
-        await cancelBenchmarkRun(run.id);
-        message.textContent = "Stopping benchmark run…";
-        setTimeout(() => loadBenchmarkDetail(run.id), 500);
-      } catch (error) {
-        message.textContent = `Could not stop: ${error}`;
-        stop.disabled = false;
-      }
-    };
-    if (run.status === "running") {
-      benchmarkDetailTimer = setTimeout(() => {
-        if (location.hash === `#/benchmark/${run.id}`) loadBenchmarkDetail(run.id);
-      }, 2500);
-    }
-  } catch (error) {
-    message.textContent = `Could not load benchmark run: ${error}`;
-  }
-}
-
-async function viewBenchmarkLog(runId, path) {
-  const panel = $("benchmark-log-panel");
-  const content = $("benchmark-log-content");
-  $("benchmark-log-title").textContent = `Agent log · ${path}`;
-  content.textContent = "Loading…";
-  panel.hidden = false;
-  try {
-    const res = await fetch(
-      `/api/bench/runs/${encodeURIComponent(runId)}/file?path=${encodeURIComponent(path)}`,
-      { cache: "no-store" }
-    );
-    content.textContent = res.ok ? await res.text() : `Error: HTTP ${res.status}`;
-  } catch (error) {
-    content.textContent = `Error: ${error}`;
-  }
-  panel.scrollIntoView({ behavior: "smooth" });
-}
-
-$("btn-benchmarks-refresh")?.addEventListener("click", loadBenchmarks);
-$("benchmarks-status")?.addEventListener("change", loadBenchmarks);
-let benchmarkSearchTimer = null;
-$("benchmarks-search")?.addEventListener("input", () => {
-  clearTimeout(benchmarkSearchTimer);
-  benchmarkSearchTimer = setTimeout(loadBenchmarks, 250);
-});
-
 // ── Hash routing ────────────────────────────────────────────────────────────
 function route() {
-  clearTimeout(benchmarkDetailTimer);
-  benchmarkDetailTimer = null;
   const hash = location.hash || "#/";
   const runMatch = hash.match(/^#\/run\/(\d+)$/);
-  const benchmarkMatch = hash.match(/^#\/benchmark\/(\d+)$/);
   const targetMatch = hash.match(/^#\/target\/(.+)$/);
   const views = {
     dashboard: $("view-dashboard"),
     history: $("view-history"),
-    benchmarks: $("view-benchmarks"),
-    benchmarkDetail: $("view-benchmark-detail"),
     reproduction: $("view-reproduction"),
     detail: $("view-run-detail"),
     disclosures: $("view-disclosures"),
@@ -5361,15 +5420,6 @@ function route() {
     stopAuditProcessTree();
     liveDetailRunId = null;
     detailRunId = null;
-  }
-
-  if (benchmarkMatch) {
-    views.benchmarkDetail.hidden = false;
-    tabs.forEach((t) => {
-      if (t.dataset.route === "benchmarks") t.classList.add("tab-active");
-    });
-    loadBenchmarkDetail(benchmarkMatch[1]);
-    return;
   }
 
   if (runMatch) {
@@ -5418,12 +5468,6 @@ function route() {
       if (t.dataset.route === "cves") t.classList.add("tab-active");
     });
     loadCves();
-  } else if (hash.startsWith("#/benchmarks")) {
-    views.benchmarks.hidden = false;
-    tabs.forEach((t) => {
-      if (t.dataset.route === "benchmarks") t.classList.add("tab-active");
-    });
-    loadBenchmarks();
   } else if (hash.startsWith("#/history")) {
     views.history.hidden = false;
     tabs.forEach((t) => {
@@ -5463,176 +5507,6 @@ function initScrollTopButton() {
   update();
 }
 
-// ── Authentication ─────────────────────────────────────────────────────────
-let applicationStarted = false;
-
-function setAuthError(message = "") {
-  authError.textContent = message;
-}
-
-function showAuthPanel(mode, message = "") {
-  const setup = mode === "setup";
-  const register = mode === "register";
-  $("auth-title").textContent = setup
-    ? "Set up CodeAuditor"
-    : register
-      ? "Create a CodeAuditor account"
-      : "Sign in to CodeAuditor";
-  $("auth-intro").textContent = setup
-    ? "Create the administrator account before using the Web UI."
-    : "Use your CodeAuditor account to access audit history and evidence.";
-  authSetupPanel.hidden = !setup;
-  authLoginPanel.hidden = setup || register;
-  authRegisterPanel.hidden = setup || !register;
-  authSwitch.hidden = setup;
-  if (!setup) {
-    authSwitchCopy.textContent = register
-      ? "Already have an account?"
-      : "Need an account?";
-    authSwitchButton.textContent = register ? "Sign in" : "Create account";
-  }
-  authGate.hidden = false;
-  authLoading.hidden = true;
-  appShell.hidden = true;
-  authUserMenu.hidden = true;
-  setAuthError(message);
-}
-
-function showAuthenticatedApp(user) {
-  authLoading.hidden = true;
-  authGate.hidden = true;
-  appShell.hidden = false;
-  authUserMenu.hidden = false;
-  authUserLabel.textContent = `${user.username} · ${user.role}`;
-  setAuthError();
-  if (!applicationStarted) {
-    applicationStarted = true;
-    startApplication();
-  }
-}
-
-async function authJson(path, payload) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify(payload),
-  });
-  let body = {};
-  try {
-    body = await response.json();
-  } catch (_) {
-    // Preserve a useful generic error for non-JSON server failures.
-  }
-  if (!response.ok) {
-    throw new Error(
-      errorDetail(body.detail) || `Request failed (${response.status})`
-    );
-  }
-  return body;
-}
-
-function credentialsFrom(formId, confirmId = "") {
-  const authForm = $(formId);
-  const username = authForm.elements.username.value;
-  const password = authForm.elements.password.value;
-  if (confirmId && password !== $(confirmId).value) {
-    throw new Error("Passwords do not match.");
-  }
-  return { username, password };
-}
-
-function setFormBusy(formId, busy) {
-  $(formId).querySelector("button[type=submit]").disabled = busy;
-}
-
-$("auth-setup-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setAuthError();
-  setFormBusy("auth-setup-form", true);
-  try {
-    const credentials = credentialsFrom("auth-setup-form", "auth-setup-confirm");
-    const result = await authJson("/api/auth/setup", credentials);
-    showAuthenticatedApp(result.user);
-  } catch (error) {
-    setAuthError(error.message);
-  } finally {
-    setFormBusy("auth-setup-form", false);
-  }
-});
-
-$("auth-login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setAuthError();
-  setFormBusy("auth-login-form", true);
-  try {
-    const credentials = credentialsFrom("auth-login-form");
-    const result = await authJson("/api/auth/login", credentials);
-    showAuthenticatedApp(result.user);
-  } catch (error) {
-    setAuthError(error.message);
-  } finally {
-    setFormBusy("auth-login-form", false);
-  }
-});
-
-$("auth-register-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setAuthError();
-  setFormBusy("auth-register-form", true);
-  try {
-    const credentials = credentialsFrom(
-      "auth-register-form",
-      "auth-register-confirm"
-    );
-    await authJson("/api/auth/register", credentials);
-    $("auth-login-username").value = credentials.username;
-    showAuthPanel("login", "Account created. Sign in to continue.");
-  } catch (error) {
-    setAuthError(error.message);
-  } finally {
-    setFormBusy("auth-register-form", false);
-  }
-});
-
-authSwitchButton.addEventListener("click", () => {
-  const showingRegister = !authRegisterPanel.hidden;
-  showAuthPanel(showingRegister ? "login" : "register");
-});
-
-$("btn-logout").addEventListener("click", async () => {
-  const button = $("btn-logout");
-  button.disabled = true;
-  try {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      credentials: "same-origin",
-    });
-  } finally {
-    window.location.reload();
-  }
-});
-
-async function bootstrapAuthentication() {
-  try {
-    const response = await fetch("/api/auth/status", {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    const status = await response.json();
-    if (!response.ok) {
-      throw new Error(status.detail || `Authentication status failed (${response.status})`);
-    }
-    if (status.authenticated && status.user) {
-      showAuthenticatedApp(status.user);
-    } else {
-      showAuthPanel(status.setup_required ? "setup" : "login");
-    }
-  } catch (error) {
-    showAuthPanel("login", `Authentication service unavailable: ${error.message}`);
-  }
-}
-
 // ── Boot ────────────────────────────────────────────────────────────────────
 async function startApplication() {
   resetStages();
@@ -5659,4 +5533,4 @@ async function startApplication() {
   );
 }
 
-bootstrapAuthentication();
+startApplication();

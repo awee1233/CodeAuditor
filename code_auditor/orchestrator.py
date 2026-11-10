@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Protocol
@@ -7,9 +8,12 @@ from uuid import uuid4
 
 from .checkpoint import CheckpointManager
 from .config import AuditConfig, resolve_agent_model
+from .layout import stage1_paths
 from .logger import get_logger
-from .repos import ensure_poc_worktree
+from .repos import cleanup_poc_worktree, ensure_poc_worktree
 from .runtime_capabilities import require_stage56_execution
+from .stage_runtime import stage_span
+from .stage_state import StageStateStore
 from .stages.stage0 import run_setup
 from .stages.stage1 import run_stage1
 from .stages.stage2 import run_stage2
@@ -43,16 +47,24 @@ def _run_model(config: AuditConfig) -> str | None:
         return None
 
 
-def _run_extra(config: AuditConfig) -> dict[str, object]:
+def _run_extra(
+    config: AuditConfig, *, run_kind: str = "audit"
+) -> dict[str, object]:
     return {
-        "run_kind": "audit",
+        "run_kind": run_kind,
         "target": config.target,
         "backend": config.backend,
         "sandbox_enabled": config.sandbox_enabled,
     }
 
 
-def _start_run_trajectory(config: AuditConfig) -> TrajectoryRecorder | None:
+def _start_run_trajectory(
+    config: AuditConfig,
+    *,
+    run_kind: str = "audit",
+    system_message: str | None = None,
+    user_message: str | None = None,
+) -> TrajectoryRecorder | None:
     """Create (or resume) the run-level ATIF document.
 
     The run-level document records orchestration only: the system/user framing
@@ -89,7 +101,7 @@ def _start_run_trajectory(config: AuditConfig) -> TrajectoryRecorder | None:
             existing.redact = config.trajectory_redact
             existing.blob_dir = blob_dir
             existing.model_name = existing.model_name or _run_model(config)
-            existing.extend_extra(_run_extra(config))
+            existing.extend_extra(_run_extra(config, run_kind=run_kind))
             config.trajectory_root = existing
             logger.info(
                 "Resuming run-level trajectory %s (%d steps).",
@@ -110,16 +122,20 @@ def _start_run_trajectory(config: AuditConfig) -> TrajectoryRecorder | None:
         max_total_inline_bytes=config.trajectory_max_total_inline_bytes,
         redact=config.trajectory_redact,
         blob_dir=blob_dir,
-        extra=_run_extra(config),
+        extra=_run_extra(config, run_kind=run_kind),
     )
     root.system(
-        "CodeAuditor multi-stage audit: security-context research, analysis-unit "
-        "decomposition, bug discovery, finding evaluation, PoC reproduction, and "
-        "disclosure preparation.",
-        extra={"stages": 7},
+        system_message
+        or (
+            "CodeAuditor multi-stage audit: security-context research, "
+            "analysis-unit decomposition, bug discovery, finding evaluation, "
+            "PoC reproduction, and disclosure preparation."
+        ),
+        extra={"run_kind": run_kind},
     )
     root.user(
-        f"Audit the repository at {config.target} for security vulnerabilities.",
+        user_message
+        or f"Audit the repository at {config.target} for security vulnerabilities.",
         extra={
             "scope": config.scope or "",
             "threat_model": config.threat_model,
@@ -128,6 +144,29 @@ def _start_run_trajectory(config: AuditConfig) -> TrajectoryRecorder | None:
     )
     config.trajectory_root = root
     return root
+
+
+def start_run_trajectory(
+    config: AuditConfig,
+    *,
+    run_kind: str,
+    system_message: str,
+    user_message: str,
+) -> TrajectoryRecorder | None:
+    """Start a run-level trajectory for non-audit maintenance workflows."""
+    return _start_run_trajectory(
+        config,
+        run_kind=run_kind,
+        system_message=system_message,
+        user_message=user_message,
+    )
+
+
+def finish_run_trajectory(
+    config: AuditConfig, root: TrajectoryRecorder | None
+) -> None:
+    """Publish a previously started run-level trajectory."""
+    _finish_run_trajectory(config, root)
 
 
 def _backfill_subagent_refs(root: TrajectoryRecorder, base: Path) -> int:
@@ -216,17 +255,6 @@ def _finish_run_trajectory(
         config.trajectory_root = None
 
 
-def _record_stage(config: AuditConfig, stage: int, description: str) -> None:
-    """Add a system step for one stage boundary to the run trajectory."""
-    root = config.trajectory_root
-    if root is None:
-        return
-    try:
-        root.system(f"Stage {stage}: {description}", extra={"stage": stage})
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Could not record stage %d in the trajectory: %s", stage, exc)
-
-
 class ProgressReporter(Protocol):
     """Receives stage lifecycle updates from the audit pipeline."""
 
@@ -241,6 +269,62 @@ class ProgressReporter(Protocol):
     ) -> None: ...
 
     def end_stage(self, stage: int) -> None: ...
+
+
+def _select_stage5_vulnerabilities(
+    vuln_files: list[str], *, full_analysis: bool = False
+) -> list[str]:
+    """Select Stage 5 targets, defaulting to Critical/High findings only.
+
+    Full analysis reproduces every evaluated vulnerability. The opt-in
+    environment budget can further cap or raise the CVSS threshold.
+    """
+    try:
+        max_items = int(os.environ.get("CODE_AUDITOR_MAX_STAGE5_VULNS", "0"))
+    except ValueError:
+        max_items = 0
+    try:
+        min_score = float(os.environ.get("CODE_AUDITOR_MIN_STAGE5_CVSS", "0"))
+    except ValueError:
+        min_score = 0.0
+    env_full = os.environ.get("CODE_AUDITOR_FULL_ANALYSIS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    include_all = full_analysis or env_full
+    ranked: list[tuple[int, float, str]] = []
+    for index, path in enumerate(vuln_files):
+        severity = ""
+        score = 0.0
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                severity = str(data.get("severity") or "").strip().lower()
+                score = float(data.get("cvss_score") or 0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        if not include_all and severity not in {"critical", "high"} and score < 7.0:
+            continue
+        if score < min_score:
+            continue
+        ranked.append((index, score, path))
+    if max_items > 0:
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        ranked = ranked[:max_items]
+    selected = [path for _index, _score, path in ranked]
+    mode = "full" if include_all else "Critical/High"
+    logger.info(
+        "Stage 5 selection (%s) selected %d/%d vulnerabilities "
+        "(min CVSS %.1f, max items %d).",
+        mode,
+        len(selected),
+        len(vuln_files),
+        min_score,
+        max_items,
+    )
+    return selected
 
 
 async def run_audit(
@@ -260,103 +344,150 @@ async def _run_audit_stages(
     reporter: ProgressReporter | None = None,
 ) -> None:
     checkpoint = CheckpointManager(config.output_dir, config.resume)
-
+    stage_state = StageStateStore(config.output_dir)
+    stage_state.reset(preserve_completed=config.resume)
     if config.resume:
+        # Stage 6 is terminal and may be retried after a validation failure.
+        # Keep stages 0-5 timings, but never leave Stage 6 marked done while its
+        # failed disclosure tasks are running again.
+        stage_state.clear(6)
         logger.info("Resume mode enabled. Existing output files and markers will be reused.")
 
-    # Stage 0: setup
-    _record_stage(config, 0, "Setting up output directory")
-    if reporter:
-        reporter.begin_stage(0, "Setting up output directory")
-    await run_setup(config)
-    if reporter:
-        reporter.end_stage(0)
+    async with stage_span(
+        config, reporter, stage_state, 0, "Setting up output directory"
+    ):
+        await run_setup(config)
 
-    # Stage 1: security context research
-    _record_stage(config, 1, "Researching security context")
-    if reporter:
-        reporter.begin_stage(1, "Researching security context")
-    stage1_out = await run_stage1(config, checkpoint)
-    if reporter:
-        reporter.end_stage(1)
+    async with stage_span(
+        config, reporter, stage_state, 1, "Researching security context"
+    ):
+        stage1_out = await run_stage1(config, checkpoint)
 
     # Resolve directive paths (from stage1 output or default locations)
-    details_dir = os.path.join(config.output_dir, "stage1-security-context")
+    stage1 = stage1_paths(config.output_dir)
     auditing_focus_path = (
         stage1_out.auditing_focus_path if stage1_out
-        else os.path.join(details_dir, "auditing-focus.md")
+        else stage1["focus"]
     )
     vuln_criteria_path = (
         stage1_out.vuln_criteria_path if stage1_out
-        else os.path.join(details_dir, "vulnerability-criteria.md")
+        else stage1["criteria"]
     )
 
-    # Stage 2: decompose project into analysis units
-    _record_stage(config, 2, "Decomposing codebase")
-    if reporter:
-        reporter.begin_stage(2, "Decomposing codebase")
-    analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
-    if reporter:
-        reporter.stage_progress(2, items_done=len(analysis_units), items_total=len(analysis_units),
-                                detail=f"{len(analysis_units)} analysis units found")
-        reporter.end_stage(2)
-
-    if not analysis_units:
-        raise RuntimeError("Stage 2 produced no analysis units.")
+    async with stage_span(
+        config, reporter, stage_state, 2, "Decomposing codebase"
+    ) as progress:
+        analysis_units = await run_stage2(config, checkpoint, auditing_focus_path)
+        if not analysis_units:
+            raise RuntimeError("Stage 2 produced no analysis units.")
+        progress.update(
+            items_done=len(analysis_units),
+            items_total=len(analysis_units),
+            detail=f"{len(analysis_units)} analysis units found",
+        )
 
     # Stage 3: bug discovery per AU
     total_aus = len(analysis_units)
-    _record_stage(config, 3, f"Discovering bugs across {total_aus} AUs")
-    if reporter:
-        reporter.begin_stage(3, f"Discovering bugs across {total_aus} AUs")
-
-    bug_files = await run_stage3(
-        analysis_units, config, checkpoint,
-        auditing_focus_path, vuln_criteria_path,
-    )
-    if reporter:
-        reporter.stage_progress(3, items_done=total_aus, items_total=total_aus,
-                                detail=f"{len(bug_files)} findings")
-        reporter.end_stage(3)
+    async with stage_span(
+        config,
+        reporter,
+        stage_state,
+        3,
+        f"Discovering bugs across {total_aus} AUs",
+    ) as progress:
+        bug_files = await run_stage3(
+            analysis_units,
+            config,
+            checkpoint,
+            auditing_focus_path,
+            vuln_criteria_path,
+            progress=progress,
+        )
+        progress.update(
+            items_done=total_aus,
+            items_total=total_aus,
+            detail=f"{len(bug_files)} findings",
+        )
 
     # Stage 4: evaluate findings
-    _record_stage(config, 4, f"Evaluating {len(bug_files)} findings")
-    if reporter:
-        reporter.begin_stage(4, f"Evaluating {len(bug_files)} findings")
-    vuln_files = await run_stage4(bug_files, config, checkpoint, vuln_criteria_path)
-    if reporter:
-        reporter.stage_progress(4, items_done=len(vuln_files), items_total=len(bug_files),
-                                detail=f"{len(vuln_files)} confirmed vulnerabilities")
-        reporter.end_stage(4)
+    async with stage_span(
+        config,
+        reporter,
+        stage_state,
+        4,
+        f"Evaluating {len(bug_files)} findings",
+    ) as progress:
+        vuln_files = await run_stage4(
+            bug_files, config, checkpoint, vuln_criteria_path, progress=progress
+        )
+        progress.update(
+            items_done=len(vuln_files),
+            items_total=len(bug_files),
+            detail=f"{len(vuln_files)} representative vulnerabilities after semantic dedupe",
+        )
+
+    stage5_vuln_files = _select_stage5_vulnerabilities(
+        vuln_files, full_analysis=config.full_analysis
+    )
 
     # Stage 5: PoC reproduction per verified vulnerability
-    _record_stage(config, 5, f"Reproducing {len(vuln_files)} vulnerabilities")
-    if reporter:
-        reporter.begin_stage(5, f"Reproducing {len(vuln_files)} vulnerabilities")
-    if vuln_files:
-        sandbox_mode = (
-            "docker-networked"
-            if config.sandbox_enabled and config.sandbox_network_enabled
-            else "docker-isolated"
-            if config.sandbox_enabled
-            else "local-worktree"
+    async with stage_span(
+        config,
+        reporter,
+        stage_state,
+        5,
+        f"Reproducing {len(stage5_vuln_files)} vulnerabilities",
+    ) as progress:
+        if stage5_vuln_files:
+            sandbox_mode = (
+                "docker-networked"
+                if config.sandbox_enabled and config.sandbox_network_enabled
+                else "docker-isolated"
+                if config.sandbox_enabled
+                else "local-worktree"
+            )
+            require_stage56_execution(sandbox_mode, config.sandbox_runtime)
+        if stage5_vuln_files and not config.sandbox_enabled and config.poc_worktree is None:
+            config.poc_worktree = await ensure_poc_worktree(
+                config.target, config.output_dir
+            )
+        stage5_reports = await run_stage5(
+            stage5_vuln_files, config, checkpoint, progress=progress
         )
-        require_stage56_execution(sandbox_mode, config.sandbox_runtime)
-    if vuln_files and not config.sandbox_enabled and config.poc_worktree is None:
-        config.poc_worktree = await ensure_poc_worktree(config.target, config.output_dir)
-    stage5_reports = await run_stage5(vuln_files, config, checkpoint)
-    if reporter:
-        reporter.stage_progress(5, items_done=len(stage5_reports), items_total=len(vuln_files),
-                                detail=f"{len(stage5_reports)} PoCs reproduced")
-        reporter.end_stage(5)
+        progress.update(
+            items_done=len(stage5_reports),
+            items_total=len(stage5_vuln_files),
+            detail=f"{len(stage5_reports)} PoCs reproduced",
+        )
 
     # Stage 6: disclosure preparation per reproduced vulnerability
-    _record_stage(config, 6, f"Preparing {len(stage5_reports)} disclosures")
-    if reporter:
-        reporter.begin_stage(6, f"Preparing {len(stage5_reports)} disclosures")
-    await run_stage6(stage5_reports, config, checkpoint)
-    if reporter:
-        reporter.end_stage(6)
+    async with stage_span(
+        config,
+        reporter,
+        stage_state,
+        6,
+        f"Preparing {len(stage5_reports)} disclosures",
+    ) as progress:
+        disclosure_reports = await run_stage6(
+            stage5_reports, config, checkpoint, progress=progress
+        )
+        candidate_total = int(
+            getattr(config, "stage6_candidate_total", len(stage5_reports))
+        )
+        progress.update(
+            items_done=len(disclosure_reports),
+            items_total=candidate_total,
+            detail=f"{len(disclosure_reports)} disclosure packages prepared",
+        )
+
+    if not config.sandbox_enabled:
+        # Retained reports/trajectories are independent of the disposable
+        # worktree. Clean it after a terminal Stage 6 result even when some
+        # disclosure sub-tasks failed; otherwise a failed run can leave tens of
+        # gigabytes of rebuild caches behind indefinitely.
+        await cleanup_poc_worktree(
+            config.target, config.output_dir, config.poc_worktree
+        )
 
     if config.task_errors:
         logger.error(
